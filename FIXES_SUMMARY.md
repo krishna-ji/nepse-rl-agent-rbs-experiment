@@ -1,10 +1,13 @@
 # NEPSE RL Policy Collapse Fix Summary
+
 ## 🔬 MDP Debugging Results & Solutions
 
 ### 🚨 **Original Problem Diagnosis**
+
 Your agent was trapped in a pathological local optimum with:
+
 - **Final average reward**: -0.75 to -0.95 (indicating systematic penalty accumulation)
-- **Action distribution**: 81% Cash, 19% Long positions 
+- **Action distribution**: 81% Cash, 19% Long positions
 - **Root cause**: Agent learned that taking positions guarantees penalties
 
 ### 🎯 **Four Critical Fixes Applied**
@@ -12,7 +15,9 @@ Your agent was trapped in a pathological local optimum with:
 ---
 
 ## **Fix #1: Reward Topology Re-Engineering**
+
 **PROBLEM**: Double-penalizing risk management mechanisms
+
 ```python
 # ❌ ORIGINAL (Pathological)
 if forced_liquidation:
@@ -27,8 +32,10 @@ if forced_liquidation:
 
 ---
 
-## **Fix #2: Feature Manifold Standardization** 
+## **Fix #2: Feature Manifold Standardization**
+
 **PROBLEM**: Gradient fracturing from mixed scaling ranges
+
 ```python
 # ❌ ORIGINAL (Inconsistent scaling)
 pct_k, pct_d: [0.0, 1.0] range
@@ -45,7 +52,9 @@ natr, bbw, d_low: Z-scored and clipped to [-1,+1]
 ---
 
 ## **Fix #3: PPO Hyperparameter Matrix Correction**
+
 **PROBLEM**: Hyperparameters guaranteeing instability
+
 ```python
 # ❌ ORIGINAL (Unstable)
 learning_rate=3e-4,     # Too aggressive for sparse rewards
@@ -63,7 +72,9 @@ batch_size=512,         # Increased for smoother advantage estimation
 ---
 
 ## **Fix #4: Structural Volatility Thresholding**
+
 **PROBLEM**: Chandelier exits too tight for frontier market microstructure
+
 ```python
 # ❌ ORIGINAL (Too tight for NEPSE) 
 ATR_MULT = 2.5
@@ -79,6 +90,7 @@ ATR_MULT = 3.5
 ## **Additional Improvements**
 
 ### **Opportunity Cost Reduction**
+
 ```python
 # Reduced cash holding punishment
 OC_SCALE = 0.1  # Instead of 0.5
@@ -86,6 +98,7 @@ CASH_FRICTION = 0.0  # Eliminated entirely
 ```
 
 ### **Extended Training**
+
 ```python
 TOTAL_TIMESTEPS = 1_000_000  # Extended from 500k
 ```
@@ -95,17 +108,20 @@ TOTAL_TIMESTEPS = 1_000_000  # Extended from 500k
 ## **🔮 Expected Results**
 
 ### **Immediate Improvements**
+
 - **Final rewards**: Target -0.1 to +0.2 (vs. original -0.8)
 - **Action distribution**: More balanced (target 40-60% positions vs. 19%)  
 - **Convergence stability**: Reduced oscillations, cleaner learning curves
 - **Forced liquidations**: Significantly reduced frequency
 
 ### **Training Metrics**
+
 - **Policy loss**: Stable descent without cliff drops
-- **Value loss**: Smoother convergence 
+- **Value loss**: Smoother convergence
 - **Episode rewards**: Progressive improvement without plateauing
 
 ### **Strategic Behavior**
+
 - Agent will learn **selective positioning** rather than cash hoarding
 - Natural risk management through proper entry timing
 - Market-driven exits rather than penalty avoidance
@@ -133,7 +149,7 @@ The original agent was **perfectly rational** under the broken reward topology. 
 ## **🚀 Next Steps**
 
 1. **Monitor Training**: Watch for improved reward progression and action balance
-2. **Backtest Analysis**: Compare performance across multiple tickers 
+2. **Backtest Analysis**: Compare performance across multiple tickers
 3. **Risk Metrics**: Verify reduced forced liquidation rates
 4. **Sensitivity Analysis**: Test parameter robustness across different market regimes
 

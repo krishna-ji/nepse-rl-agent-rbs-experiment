@@ -14,4 +14,6 @@ data/
 
 # outputs (models, eval results, plots)
 outputs/
+runs/
+logs/
 

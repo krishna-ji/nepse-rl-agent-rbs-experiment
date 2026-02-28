@@ -6,16 +6,8 @@ Fuses deterministic technical heuristics (Chandelier Exit, Stochastic Oscillator
 ## Project Structure
 
 ```
-src/
-  data_loader.py   – Phase 1: Universal date-aligned MultiIndex loader
-  features.py      – Phase 2: Vectorised feature engineering (Stochastic, ATR, BBW, …)
-  environment.py   – Phase 3-5: Custom Gymnasium env with Chandelier-Exit TSL
-  trainer.py       – Phase 6: PPO training harness (Stable-Baselines3)
-  visualize.py     – Phase 7: Plotly diagnostic candlestick + overlay charts
-runs/
-  train.py         – Full training script
-  evaluate.py      – Out-of-sample evaluation & HTML report generation
-  quick_test.py    – Smoke test (≈ 20 s) to verify the pipeline
+notebooks/
+  simple_rl.ipynb  – Self-contained end-to-end notebook (data → features → env → PPO → eval → plots)
 data/stocks/       – OHLCV CSVs (636 files, 555 with data)
 ```
 
@@ -40,14 +32,16 @@ uv run python main.py eval --multi 10
 
 ## Architecture Overview
 
-| Phase | Module | Description |
-|-------|--------|-------------|
-| 1 | `data_loader` | Loads 636 NEPSE CSVs → universal DatetimeIndex MultiIndex DataFrame, warm-up padding (200-day SMA lookback) |
-| 2 | `features` | Stochastic %K/%D, NATR, BBW, SMA50/200, protected swing low, macro trend |
-| 3-4 | `environment` | `gym.Env` with Discrete(2) actions, Chandelier-Exit ATR trailing stop, forced liquidation override |
-| 5 | `environment` | Log-return reward, −0.015 transaction friction, −2.0 liquidation penalty |
-| 6 | `trainer` | PPO (Stable-Baselines3), DummyVecEnv, checkpoint + eval callbacks |
-| 7 | `visualize` | Interactive Plotly: candlestick, SMA200, swing low, TSL, buy/sell markers, stochastic subplot |
+Everything lives in `notebooks/simple_rl.ipynb` — a single self-contained notebook covering:
+
+| Phase | Description |
+|-------|-------------|
+| 1 | Load NEPSE CSVs → universal DatetimeIndex MultiIndex DataFrame, warm-up padding (200-day lookback) |
+| 2 | Stochastic %K/%D, NATR, BBW, SMA50/200, protected swing low, macro trend |
+| 3-4 | `gym.Env` with Discrete(2) actions, Chandelier-Exit ATR trailing stop, forced liquidation override |
+| 5 | Log-return reward, −0.015 transaction friction, −2.0 liquidation penalty |
+| 6 | PPO (Stable-Baselines3), DummyVecEnv, checkpoint + eval callbacks |
+| 7 | Equity curves, buy/sell signals, metrics summary |
 
 ## Key Design Decisions
 

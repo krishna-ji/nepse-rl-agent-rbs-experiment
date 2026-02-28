@@ -10,10 +10,11 @@ Consolidated single-file version with critical MDP fixes:
 """
 
 import warnings; warnings.filterwarnings("ignore")
-import logging, pathlib, datetime, numpy as np, pandas as pd
+import logging, pathlib, datetime, time, numpy as np, pandas as pd
 import matplotlib.pyplot as plt
 import gymnasium as gym
 from gymnasium import spaces
+import torch
 from stable_baselines3 import PPO
 from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.monitor import Monitor
@@ -49,13 +50,20 @@ def setup_logging_and_directories():
     fh.setFormatter(fmt)
     log.addHandler(fh)
     
-    DATA_DIR = pathlib.Path("data/stocks")
+    DATA_DIR = pathlib.Path("data/ohlcv/1D/stocks")
+    
+    # Detect CUDA
+    DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
     
     log.info(f"🚀 NEPSE RL FIXED VERSION STARTING")
     log.info(f"Run dir : {RUN_DIR.resolve()}")
     log.info(f"Data dir: {DATA_DIR.resolve()}")
+    if DEVICE == "cuda":
+        log.info(f"🔥 GPU   : {torch.cuda.get_device_name(0)} (CUDA {torch.version.cuda})")
+    else:
+        log.info(f"⚠️  GPU   : Not available — running on CPU")
     
-    return log, RUN_DIR, DATA_DIR
+    return log, RUN_DIR, DATA_DIR, DEVICE
 
 # ============================================================================
 # DATA LOADING
@@ -439,32 +447,48 @@ class NepseEnvFixed(gym.Env):
 # ============================================================================
 
 class EnhancedRewardTracker(BaseCallback):
-    """Enhanced callback with CSV export capability"""
+    """Enhanced callback with CSV export capability and action diagnostics"""
     def __init__(self, run_dir):
         super().__init__(verbose=0)
         self.run_dir = pathlib.Path(run_dir)
         self.ep_timesteps = []
         self.ep_rewards = []
+        self.ep_lengths = []
         self.update_ts = []
         self.policy_losses = []
         self.value_losses = []
         self.entropy_losses = []
+        self.approx_kls = []
+        self.clip_fractions = []
+        self.explained_vars = []
+        self.learning_rates = []
         self._ep_count = 0
+        self._best_avg = -np.inf
         
     def _on_step(self):
         for info in self.locals.get("infos", []):
             if "episode" in info:
                 self.ep_timesteps.append(self.num_timesteps)
                 self.ep_rewards.append(info["episode"]["r"])
+                self.ep_lengths.append(info["episode"]["l"])
                 self._ep_count += 1
                 
                 if self._ep_count % 50 == 0:
-                    recent_avg = np.mean(self.ep_rewards[-50:])
-                    recent_std = np.std(self.ep_rewards[-50:])
-                    # Log with more detail
+                    recent = self.ep_rewards[-50:]
+                    recent_avg = np.mean(recent)
+                    recent_std = np.std(recent)
+                    recent_min = np.min(recent)
+                    recent_max = np.max(recent)
                     log = logging.getLogger("nepserl")
-                    log.info(f"Episode {self._ep_count:4d} | Steps: {self.num_timesteps:7d} | "
-                           f"Reward: {recent_avg:+.4f}±{recent_std:.3f}")
+                    
+                    marker = ""
+                    if recent_avg > self._best_avg:
+                        self._best_avg = recent_avg
+                        marker = " ★ NEW BEST"
+                    
+                    log.info(f"Ep {self._ep_count:5d} | ts {self.num_timesteps:8d} | "
+                           f"R {recent_avg:+.4f}±{recent_std:.3f} "
+                           f"[{recent_min:+.3f}, {recent_max:+.3f}]{marker}")
                     
                     # Export intermediate CSV every 100 episodes  
                     if self._ep_count % 100 == 0:
@@ -475,9 +499,13 @@ class EnhancedRewardTracker(BaseCallback):
         try:
             vals = self.model.logger.name_to_value
             self.update_ts.append(self.num_timesteps)
-            self.policy_losses.append(vals.get("train/policy_gradient_loss", 0.0))
-            self.value_losses.append(vals.get("train/value_loss", 0.0))
-            self.entropy_losses.append(vals.get("train/entropy_loss", 0.0))
+            self.policy_losses.append(vals.get("train/policy_gradient_loss", np.nan))
+            self.value_losses.append(vals.get("train/value_loss", np.nan))
+            self.entropy_losses.append(vals.get("train/entropy_loss", np.nan))
+            self.approx_kls.append(vals.get("train/approx_kl", np.nan))
+            self.clip_fractions.append(vals.get("train/clip_fraction", np.nan))
+            self.explained_vars.append(vals.get("train/explained_variance", np.nan))
+            self.learning_rates.append(vals.get("train/learning_rate", np.nan))
         except Exception:
             pass
     
@@ -489,12 +517,13 @@ class EnhancedRewardTracker(BaseCallback):
         # Episode rewards CSV
         episode_df = pd.DataFrame({
             'timestep': self.ep_timesteps,
+            'episode_number': range(1, len(self.ep_rewards) + 1),
             'episode_reward': self.ep_rewards,
-            'episode_number': range(1, len(self.ep_rewards) + 1)
+            'episode_length': self.ep_lengths,
         })
         
         # Add moving averages
-        for window in [10, 50]:
+        for window in [10, 50, 100]:
             if len(self.ep_rewards) >= window:
                 episode_df[f'reward_ma_{window}'] = episode_df['episode_reward'].rolling(window).mean()
         
@@ -507,12 +536,16 @@ class EnhancedRewardTracker(BaseCallback):
                 'timestep': self.update_ts,
                 'policy_loss': self.policy_losses,
                 'value_loss': self.value_losses,
-                'entropy_loss': self.entropy_losses
+                'entropy_loss': self.entropy_losses,
+                'approx_kl': self.approx_kls,
+                'clip_fraction': self.clip_fractions,
+                'explained_variance': self.explained_vars,
+                'learning_rate': self.learning_rates,
             })
             loss_path = self.run_dir / "training_losses.csv"  
             loss_df.to_csv(loss_path, index=False)
 
-def train_fixed_ppo(feat_df, valid_start_dates, run_dir, log):
+def train_fixed_ppo(feat_df, valid_start_dates, run_dir, log, device="auto"):
     """
     FIXED PPO training with corrected hyperparameters:
     - Reduced entropy coefficient from 0.05 -> 0.005 (10x reduction)
@@ -556,17 +589,19 @@ def train_fixed_ppo(feat_df, valid_start_dates, run_dir, log):
         vf_coef=0.5,             # Unchanged
         max_grad_norm=0.5,       # Unchanged
         seed=SEED,
-        device="auto",
+        device=device,
         verbose=1,
         policy_kwargs=dict(net_arch=dict(pi=[128, 128], vf=[128, 128]))
     )
     
     log.info(f"✅ FIXED PPO model created — device={model.device}")
+    log.info(f"   Policy params: {sum(p.numel() for p in model.policy.parameters()):,}")
     
     # Enhanced callback with CSV export
     tracker = EnhancedRewardTracker(run_dir)
     
     log.info("🚀 Starting FIXED training...")
+    t0 = time.time()
     
     # Train the model  
     model.learn(
@@ -574,6 +609,9 @@ def train_fixed_ppo(feat_df, valid_start_dates, run_dir, log):
         callback=[tracker],
         progress_bar=True,
     )
+    
+    elapsed = time.time() - t0
+    log.info(f"⏱️  Training wall time: {elapsed/60:.1f} min ({elapsed:.0f}s)")
     
     vec_env.close()
     
@@ -694,7 +732,7 @@ def main():
     """Main execution function"""
     
     # Setup
-    log, run_dir, data_dir = setup_logging_and_directories()
+    log, run_dir, data_dir, device = setup_logging_and_directories()
     
     try:
         # Load data
@@ -717,7 +755,7 @@ def main():
         log.info("=" * 50)
         
         # FIXED PPO Training
-        model, tracker = train_fixed_ppo(feat_df, valid_start_dates, run_dir, log)
+        model, tracker = train_fixed_ppo(feat_df, valid_start_dates, run_dir, log, device=device)
         
         # Create summary plots
         create_summary_plots(tracker, run_dir, log)
@@ -745,6 +783,41 @@ def main():
         for action, count in actions.items():
             action_name = "Cash" if action == 0 else "Long" if action == 1 else "End"
             log.info(f"   Action {action} ({action_name}): {count} ({count/len(traj):.1%})")
+        
+        # ------------------------------------------------------------------
+        # Final comprehensive CSV exports
+        # ------------------------------------------------------------------
+        
+        # Save evaluation trajectory
+        traj_path = run_dir / "eval_trajectory.csv"
+        traj.to_csv(traj_path, index=False)
+        log.info(f"💾 Eval trajectory saved: {traj_path}")
+        
+        # Save summary metrics CSV
+        summary = {
+            "metric": [
+                "total_episodes", "total_timesteps",
+                "final_avg_reward_20", "final_avg_reward_50", "best_avg_reward_50",
+                "agent_return", "buyhold_return", "excess_return",
+                "buy_ratio", "cash_ratio",
+                "device_used", "training_wall_time_s",
+            ],
+            "value": [
+                len(tracker.ep_rewards),
+                tracker.ep_timesteps[-1] if tracker.ep_timesteps else 0,
+                np.mean(tracker.ep_rewards[-20:]) if len(tracker.ep_rewards) >= 20 else np.nan,
+                np.mean(tracker.ep_rewards[-50:]) if len(tracker.ep_rewards) >= 50 else np.nan,
+                tracker._best_avg,
+                metrics["total_return_agent"],
+                metrics["total_return_buyhold"],
+                metrics["excess_return"],
+                metrics["buy_ratio"],
+                metrics["cash_ratio"],
+                str(device),
+                "",
+            ],
+        }
+        pd.DataFrame(summary).to_csv(run_dir / "summary_metrics.csv", index=False)
         
         log.info("🎉 NEPSE RL FIXED VERSION COMPLETE!")
         log.info(f"📁 Results saved in: {run_dir}")

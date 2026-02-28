@@ -3,7 +3,7 @@ name = "nepserl"
 version = "0.1.0"
 description = "NEPSE RL Stochastic Pullback Engine"
 readme = "README.md"
-requires-python = ">=3.12"
+requires-python = ">=3.12,<3.14"
 dependencies = [
     "gymnasium>=1.2.3",
     "matplotlib>=3.10.8",
@@ -11,7 +11,16 @@ dependencies = [
     "pandas>=2.0,<3",
     "shimmy>=2.0.0",
     "stable-baselines3>=2.7.1",
-    "torch>=2.10.0",
+    "torch>=2.6.0",
     "tqdm>=4.67.3",
     "requests>=2.31.0",
+    "rich>=14.3.3",
 ]
+
+[[tool.uv.index]]
+url = "https://download.pytorch.org/whl/cu124"
+name = "pytorch-cu124"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu124" }

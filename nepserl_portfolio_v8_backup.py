@@ -1,34 +1,26 @@
 #!/usr/bin/env python3
 """
-NEPSE RL Portfolio Engine v10 — Conviction Expansion
+NEPSE RL Portfolio Engine v8 — Alpha-Gradient Continuous Allocation
 ======================================================================
-Single-file PPO engine trading 10 randomly-sampled NEPSE assets per
-episode, with a strict temporal firewall between training and evaluation.
+Single-file PPO engine trading a 10-asset NEPSE universe simultaneously.
+Instead of binary buy/sell on one ticker, the agent outputs a continuous
+Softmax weight vector [w_cash, w_1, ..., w_10] rebalancing the portfolio
+daily, paying friction only on the **turnover delta**.
 
-Key v9 innovations:
-  1. TEMPORAL FIREWALL: Train on [2012, 2024-07-01), eval on [2024-07-01, 2026]
-     -> Zero overlap. No data leakage. No memorization.
-  2. DYNAMIC UNIVERSE SAMPLING: Each reset() picks a random date FIRST,
-     then samples 10 tickers from the pool of stocks alive at that date.
-     C(325,10) x 2854 date combinations -> ~10^18 unique state tensors.
-  3. TICKER-AGNOSTIC: Agent reads pure feature geometry (CLV, Ribbon, CMF...),
-     never learns "NABIL is slot 3". Forced to generalize.
-  4. Alpha Gradient (5x active return), Softmax Temperature (2.0),
-     Deadband Filter (1%), Forward-fill OHLCV.
-
-v9 changes (over v8):
-  - TEMPORAL FIREWALL: SPLIT_DATE separates train/eval with zero overlap
-  - DYNAMIC UNIVERSE: Each episode samples 10 random tickers from pool
-  - TICKER-AGNOSTIC: Agent reads pure features, never learns ticker identity
-  - Retains: Alpha Gradient, Softmax Temperature, Deadband, Forward-fill
+v8 changes (over v7):
+  - Forward-fill OHLCV data to eliminate NaN poisoning (fixes GBIME -100%)
+  - Alpha Gradient: R += 5× (portfolio_ret - EW_benchmark_ret)
+  - Softmax Temperature (τ=2.0): sharper conviction in allocations
+  - Deadband Filter (1%): ignore micro-rebalancing from exploration noise
+  - 10M training steps (2x v7)
 
 Architecture:
-  - State: (10 assets x 11 features) + (11 current weights) = 121 dims
-  - Action: Box(-3, 3, shape=(11,)) -> Softmax(x2.0 temp) -> weights
-  - Reward: port_ret - tau*turnover + 30*(port_ret - ew_ret)
+  - State: (10 assets × 11 features) + (11 current weights) = 121 dims
+  - Action: Box(-3, 3, shape=(11,)) → Softmax(×2.0 temp) → weights
+  - Reward: port_ret - τ×turnover + 5×(port_ret - ew_ret)
 
 Hardware: 32 CPU SubprocVecEnv, RTX 4060, 128 GB RAM
-Data: 325 NEPSE tickers, 6833 daily bars (1997-2026)
+Data: 325 NEPSE tickers for feature computation, 10-asset eval universe
 """
 
 import warnings; warnings.filterwarnings("ignore")
@@ -53,19 +45,16 @@ from typing import Callable
 # ============================================================================
 
 NUM_ENVS        = 32
-TOTAL_TIMESTEPS = 15_000_000
-EPISODE_LENGTH  = 252         # 1 trading year
-MIN_ROWS        = 250         # minimum rows to load a ticker
-WARMUP          = 200         # feature warmup rows
+TOTAL_TIMESTEPS = 10_000_000
+EPISODE_LENGTH  = 252
+MIN_ROWS        = 250
+WARMUP          = 200
 SEED            = 42
-N_ASSETS        = 10          # portfolio size (slots per episode)
 
-# Temporal firewall: train BEFORE this date, eval AFTER
-SPLIT_DATE = "2024-07-01"
-
-# Fixed 10-asset evaluation universe (locked during OOS eval)
-EVAL_UNIVERSE = ["NABIL", "NICA", "SHIVM", "CHDC", "NLIC",
-                 "UPPER", "NRIC", "SBL", "GBIME", "SANIMA"]
+# Fixed 10-asset universe (same tickers used in all prior OOS evaluations)
+UNIVERSE = ["NABIL", "NICA", "SHIVM", "CHDC", "NLIC",
+            "UPPER", "NRIC", "SBL", "GBIME", "SANIMA"]
+N_ASSETS = len(UNIVERSE)
 
 # ============================================================================
 # SETUP
@@ -86,16 +75,15 @@ def setup():
     fh = logging.FileHandler(RUN_DIR / "nepserl_portfolio.log", encoding="utf-8")
     fh.setLevel(logging.DEBUG); fh.setFormatter(fmt); log.addHandler(fh)
 
-    log.info("NEPSE RL Portfolio Engine v10 — Conviction Expansion")
-    log.info(f"Run dir    : {RUN_DIR.resolve()}")
-    log.info(f"Device     : {DEVICE}")
-    log.info(f"Split date : {SPLIT_DATE}")
+    log.info("NEPSE RL Portfolio Engine v8 (Alpha-Gradient + Temperature + Deadband)")
+    log.info(f"Run dir  : {RUN_DIR.resolve()}")
+    log.info(f"Device   : {DEVICE}")
     if DEVICE == "cuda":
         p = torch.cuda.get_device_properties(0)
-        log.info(f"GPU        : {p.name}  ({p.multi_processor_count * 128} CUDA cores, "
+        log.info(f"GPU      : {p.name}  ({p.multi_processor_count * 128} CUDA cores, "
                  f"{p.total_memory / 1024**3:.1f} GB VRAM)")
-    log.info(f"CPU cores  : {multiprocessing.cpu_count()}")
-    log.info(f"Eval universe: {EVAL_UNIVERSE}")
+    log.info(f"CPU cores: {multiprocessing.cpu_count()}")
+    log.info(f"Universe : {UNIVERSE}")
     return log, RUN_DIR, DATA_DIR, DEVICE
 
 # ============================================================================
@@ -255,61 +243,37 @@ def precompile_arrays(feat_df, tickers, valid_start_dates, log):
     return ticker_arrays, valid_start_idx, dates_array, n_dates
 
 # ============================================================================
-# PORTFOLIO ENVIRONMENT — Dynamic Universe + Temporal Firewall
+# PORTFOLIO ENVIRONMENT — Continuous Softmax Allocation
 # ============================================================================
 #
 # State:  [asset_1_features(11), ..., asset_10_features(11), w_cash, w_1, ..., w_10]
 #         = 10×11 + 11 = 121 dims
 # Action: Box(-3, 3, shape=(11,)) → Softmax → [w_cash, w_1, ..., w_10]
-# Reward: ln(PV_t / PV_{t-1}) - τ × Turnover + α × Active_Return
+# Reward: ln(PV_t / PV_{t-1}) - τ × Turnover
 
 class NepsePortfolioEnv(gym.Env):
-    TAU         = 0.0015   # 0.15% per unit of turnover (reduced to allow exploration)
-    ALPHA_SCALE = 30.0     # Alpha Gradient: strong conviction signal over EW benchmark
+    TAU         = 0.005    # 0.5% per unit of turnover (one-way)
+    ALPHA_SCALE = 5.0      # Alpha Gradient: reward bonus for beating EW benchmark
     TEMPERATURE = 2.0      # Softmax temperature: sharper conviction
     DEADBAND    = 0.01     # Ignore weight shifts < 1% (silence exploration noise)
 
     def __init__(self, ticker_arrays, valid_start_idx, dates_array,
-                 all_tickers, n_assets=10, episode_length=252,
-                 split_index=None, mode="train", eval_universe=None,
-                 seed=None):
+                 universe, episode_length=252, seed=None):
         super().__init__()
         self._ta    = ticker_arrays
-        self._vsi   = valid_start_idx       # {ticker: first_valid_idx}
+        self._vsi   = valid_start_idx
         self._dates = dates_array
         self._n     = len(dates_array)
-        self._all_tickers = list(all_tickers)
-        self._n_assets = n_assets
+        self._universe = universe
+        self._n_assets = len(universe)
         self._ep_len  = episode_length
-        self._mode    = mode                # "train" or "eval"
 
-        # Temporal firewall
-        if split_index is not None:
-            self._split = split_index
-        else:
-            self._split = self._n           # no split → use everything
-
-        # For eval mode: fixed universe
-        self._eval_universe = eval_universe
-
-        # Precompute min training start: earliest index with ≥ n_assets valid
-        if mode == "train":
-            counts = np.zeros(self._n, dtype=np.int32)
-            for si in self._vsi.values():
-                if si < self._n:
-                    counts[si:] += 1
-            valid_idxs = np.where(counts >= n_assets)[0]
-            self._min_train_start = int(valid_idxs[0]) if len(valid_idxs) > 0 else 0
-        else:
-            self._min_train_start = 0
-
-        obs_dim = n_assets * N_FEATURES + (n_assets + 1)  # 10×11 + 11 = 121
+        obs_dim = self._n_assets * N_FEATURES + (self._n_assets + 1)  # 110 + 11 = 121
         self.observation_space = spaces.Box(-5.0, 5.0, shape=(obs_dim,), dtype=np.float32)
-        self.action_space = spaces.Box(-3.0, 3.0, shape=(n_assets + 1,), dtype=np.float32)
+        self.action_space = spaces.Box(-3.0, 3.0, shape=(self._n_assets + 1,), dtype=np.float32)
 
         self._rng = np.random.default_rng(seed)
-        self._current_universe = []
-        self._weights = np.zeros(n_assets + 1, dtype=np.float32)
+        self._weights = np.zeros(self._n_assets + 1, dtype=np.float32)  # [cash, a1..a10]
         self._si = 0; self._t = 0; self._pv = 1.0
 
     def _softmax(self, x):
@@ -321,34 +285,11 @@ class NepsePortfolioEnv(gym.Env):
         if seed is not None:
             self._rng = np.random.default_rng(seed)
 
-        if self._mode == "eval":
-            # ── OOS Evaluation: locked universe, start at split ────────────
-            self._current_universe = list(self._eval_universe)
-            self._si = self._split
-        else:
-            # ── Training: Date First, Assets Second ────────────────────────
-            # 1. Pick a random start date strictly BEFORE the split
-            max_start = self._split - self._ep_len
-            if max_start <= self._min_train_start:
-                max_start = self._min_train_start + 1
-            self._si = int(self._rng.integers(
-                self._min_train_start, max_start))
-
-            # 2. Build valid pool: tickers alive at this start date
-            valid_pool = [tk for tk in self._all_tickers
-                          if self._vsi.get(tk, 99999) <= self._si]
-
-            # 3. Sample N_ASSETS random tickers from pool
-            if len(valid_pool) < self._n_assets:
-                # Extremely rare fallback: shift to later date
-                self._si = self._split - self._ep_len - 1
-                valid_pool = [tk for tk in self._all_tickers
-                              if self._vsi.get(tk, 99999) <= self._si]
-            pool_arr = np.array(valid_pool)
-            chosen = self._rng.choice(
-                pool_arr, size=self._n_assets, replace=False)
-            self._current_universe = chosen.tolist()
-
+        # Find a valid start index where ALL universe tickers have data
+        latest_start = max(self._vsi.get(tk, 0) for tk in self._universe)
+        last = self._n - self._ep_len
+        if last <= latest_start: latest_start = max(0, last - 1)
+        self._si = int(self._rng.integers(latest_start, max(latest_start + 1, last)))
         self._t = 0; self._pv = 1.0
         self._weights = np.zeros(self._n_assets + 1, dtype=np.float32)
         self._weights[0] = 1.0  # start 100% cash
@@ -375,7 +316,7 @@ class NepsePortfolioEnv(gym.Env):
 
         # ── Daily log returns per asset ────────────────────────────────────
         returns = np.zeros(self._n_assets, dtype=np.float64)
-        for j, tk in enumerate(self._current_universe):
+        for j, tk in enumerate(self._universe):
             c_arr = self._ta[tk]["close"]
             c_t   = float(c_arr[i + 1])
             c_prev = float(c_arr[i])
@@ -414,7 +355,7 @@ class NepsePortfolioEnv(gym.Env):
         obs = np.zeros(self._n_assets * N_FEATURES + self._n_assets + 1, dtype=np.float32)
 
         # Fill 11 features per asset
-        for j, tk in enumerate(self._current_universe):
+        for j, tk in enumerate(self._universe):
             c = self._ta[tk]
             off = j * N_FEATURES
             for k, f in enumerate(OBS_FEATURES):
@@ -434,7 +375,7 @@ class NepsePortfolioEnv(gym.Env):
             "portfolio_value": float(self._pv),
             "cash_weight": float(self._weights[0]),
         }
-        for j, tk in enumerate(self._current_universe):
+        for j, tk in enumerate(self._universe):
             info[f"w_{tk}"] = float(self._weights[j + 1])
             c_val = float(self._ta[tk]["close"][i])
             info[f"close_{tk}"] = c_val if not np.isnan(c_val) else 0.0
@@ -518,20 +459,21 @@ def linear_schedule(initial_value: float, final_value: float = 1e-5) -> Callable
     return func
 
 # ============================================================================
-# OOS EVALUATION — locked universe, starts at SPLIT_INDEX
+# DETERMINISTIC PORTFOLIO EVALUATION
 # ============================================================================
 
 def evaluate_portfolio(model, ticker_arrays, valid_start_idx, dates_array,
-                       all_tickers, split_index, eval_universe,
-                       n_assets=10, episode_length=252):
-    """Deterministic evaluation on unseen data (post-split)."""
-    env = NepsePortfolioEnv(
-        ticker_arrays, valid_start_idx, dates_array,
-        all_tickers=all_tickers, n_assets=n_assets,
-        episode_length=episode_length,
-        split_index=split_index, mode="eval",
-        eval_universe=eval_universe, seed=123)
+                       universe, episode_length=252, seed=123):
+    """Deterministic evaluation across the full 10-asset universe."""
+    env = NepsePortfolioEnv(ticker_arrays, valid_start_idx, dates_array,
+                            universe, episode_length=episode_length, seed=seed)
     obs, info = env.reset()
+    # Fix start to latest valid start
+    latest_start = max(valid_start_idx.get(tk, 0) for tk in universe)
+    env._si = latest_start; env._t = 0; env._pv = 1.0
+    env._weights = np.zeros(len(universe) + 1, dtype=np.float32)
+    env._weights[0] = 1.0
+    obs = env._obs(); info = env._info()
 
     records = []
     done = False
@@ -541,13 +483,14 @@ def evaluate_portfolio(model, ticker_arrays, valid_start_idx, dates_array,
         obs, reward, terminated, truncated, info = env.step(action)
         done = terminated or truncated
     records.append(info.copy())
-    return pd.DataFrame(records)
+    traj = pd.DataFrame(records)
+    return traj
 
 # ============================================================================
 # PLOTS
 # ============================================================================
 
-def plot_dashboard(tracker, run_dir, total_ts, num_envs, split_date):
+def plot_dashboard(tracker, run_dir, total_ts, num_envs):
     fig, axes = plt.subplots(2, 2, figsize=(16, 10))
     ax = axes[0, 0]
     ax.plot(tracker.ep_ts, tracker.ep_rewards, alpha=0.15, color="dodgerblue", lw=0.5)
@@ -581,13 +524,12 @@ def plot_dashboard(tracker, run_dir, total_ts, num_envs, split_date):
     ax.set_xlabel("Timesteps"); ax.set_ylabel("Explained Var")
     ax.set_title("Value Function Quality"); ax.grid(alpha=0.3)
 
-    plt.suptitle(f"NEPSE Portfolio v10 — {total_ts/1e6:.0f}M steps, "
-                 f"{num_envs} envs, split={split_date}", fontsize=14)
+    plt.suptitle(f"NEPSE Portfolio v8 — {total_ts/1e6:.0f}M steps, {num_envs} envs", fontsize=14)
     plt.tight_layout()
     plt.savefig(run_dir / "training_dashboard.png", dpi=150, bbox_inches="tight")
     plt.close()
 
-def plot_portfolio_equity(traj, universe, run_dir, split_date):
+def plot_portfolio_equity(traj, universe, run_dir):
     fig, axes = plt.subplots(2, 1, figsize=(16, 10))
 
     # Top: Portfolio equity vs equal-weight B&H
@@ -602,13 +544,11 @@ def plot_portfolio_equity(traj, universe, run_dir, split_date):
         col = f"close_{tk}"
         if col in traj.columns:
             cl = traj[col].values
-            if cl[0] > 0 and not np.isnan(cl[0]):
+            if cl[0] > 0:
                 bh_pv += (cl / cl[0] - 1.0) / len(universe)
     ax.plot(bh_pv, label=f"EW B&H ({bh_pv[-1]-1:+.1%})", color="gray", lw=1.5, alpha=0.7)
     ax.axhline(1.0, color="black", ls="--", alpha=0.3)
-    ax.set_ylabel("Portfolio Value")
-    ax.set_title(f"OOS Portfolio Equity (post {split_date}): "
-                 f"Agent vs Equal-Weight B&H")
+    ax.set_ylabel("Portfolio Value"); ax.set_title("Portfolio Equity: Agent vs Equal-Weight B&H")
     ax.legend(); ax.grid(alpha=0.3)
 
     # Bottom: Weight allocation over time (stacked area)
@@ -638,108 +578,74 @@ def main():
 
     # ── Data ────────────────────────────────────────────────────────────────
     master_df, valid_start_dates, tickers = load_ohlcv(data_dir, log)
+
+    # Verify all universe tickers exist
+    missing = [tk for tk in UNIVERSE if tk not in tickers]
+    if missing:
+        log.warning(f"Universe tickers missing from data: {missing}")
+        universe = [tk for tk in UNIVERSE if tk in tickers]
+    else:
+        universe = list(UNIVERSE)
+    log.info(f"Active universe: {universe} ({len(universe)} assets)")
+
     feat_df = compute_features(master_df, valid_start_dates, log)
     ticker_arrays, valid_start_idx, dates_array, n_dates = precompile_arrays(
         feat_df, tickers, valid_start_dates, log)
 
-    # ── Compute SPLIT_INDEX from SPLIT_DATE ─────────────────────────────────
-    split_dt = np.datetime64(SPLIT_DATE)
-    split_index = int(np.searchsorted(dates_array, split_dt))
-    split_actual = pd.Timestamp(dates_array[split_index]).strftime("%Y-%m-%d")
-    oos_days = n_dates - split_index
-    log.info(f"SPLIT_INDEX = {split_index} ({split_actual}), "
-             f"OOS days = {oos_days}")
+    n_assets = len(universe)
+    obs_dim  = n_assets * N_FEATURES + (n_assets + 1)
+    act_dim  = n_assets + 1
+    log.info(f"Obs dim: {obs_dim} = {n_assets}×{N_FEATURES} + {n_assets+1}")
+    log.info(f"Act dim: {act_dim} = {n_assets} assets + cash")
 
-    # ── Training pool statistics ────────────────────────────────────────────
-    counts = np.zeros(n_dates, dtype=np.int32)
-    for si in valid_start_idx.values():
-        if si < n_dates:
-            counts[si:] += 1
-    valid_idxs = np.where(counts >= N_ASSETS)[0]
-    min_train = int(valid_idxs[0]) if len(valid_idxs) > 0 else 0
-    max_train = split_index - EPISODE_LENGTH
-    train_range_days = max_train - min_train
-    min_date = pd.Timestamp(dates_array[min_train]).strftime("%Y-%m-%d")
-    max_date = pd.Timestamp(dates_array[max_train]).strftime("%Y-%m-%d")
-    log.info(f"Training zone: [{min_date}..{max_date}] "
-             f"= {train_range_days:,} sampable start dates")
-    log.info(f"  Pool at train start ({min_date}): "
-             f"{counts[min_train]} tickers")
-    log.info(f"  Pool at train end   ({max_date}): "
-             f"{counts[max_train]} tickers")
-    log.info(f"  Eval universe: {EVAL_UNIVERSE}")
-
-    # Verify all eval tickers valid before split
-    for tk in EVAL_UNIVERSE:
-        si = valid_start_idx.get(tk, 99999)
-        if si >= split_index:
-            log.warning(f"  WARNING {tk} valid_start={si} >= split={split_index}!")
-        else:
-            log.info(f"  OK {tk} valid_start={si} "
-                     f"({pd.Timestamp(dates_array[si]).strftime('%Y-%m-%d')})")
-
-    obs_dim = N_ASSETS * N_FEATURES + (N_ASSETS + 1)
-    act_dim = N_ASSETS + 1
-    log.info(f"Obs dim: {obs_dim} = {N_ASSETS}x{N_FEATURES} + {N_ASSETS+1}")
-    log.info(f"Act dim: {act_dim} = {N_ASSETS} assets + cash")
-
-    # ── SubprocVecEnv factory (training mode) ───────────────────────────────
+    # ── SubprocVecEnv factory ───────────────────────────────────────────────
     def make_env(rank, seed=SEED):
         def _init():
             return Monitor(NepsePortfolioEnv(
                 ticker_arrays, valid_start_idx, dates_array,
-                all_tickers=tickers,
-                n_assets=N_ASSETS,
-                episode_length=EPISODE_LENGTH,
-                split_index=split_index,
-                mode="train",
-                seed=seed + rank))
+                universe, episode_length=EPISODE_LENGTH, seed=seed + rank))
         return _init
 
-    log.info(f"Spawning {NUM_ENVS} SubprocVecEnv workers (training mode)...")
-    vec_env = SubprocVecEnv(
-        [make_env(i) for i in range(NUM_ENVS)], start_method="spawn")
+    log.info(f"Spawning {NUM_ENVS} SubprocVecEnv workers...")
+    vec_env = SubprocVecEnv([make_env(i) for i in range(NUM_ENVS)], start_method="spawn")
     log.info(f"SubprocVecEnv ready — {NUM_ENVS} workers active")
 
-    # ── PPO Model ───────────────────────────────────────────────────────────
+    # ── PPO Model (continuous actions) ──────────────────────────────────────
     model = PPO(
         "MlpPolicy", vec_env,
         learning_rate=linear_schedule(2e-4),
         n_steps=4096,
-        batch_size=4096,
+        batch_size=2048,
         n_epochs=10,
         gamma=0.995,
         gae_lambda=0.95,
-        clip_range=0.2,
-        ent_coef=0.015,
+        clip_range=0.2,       # wider clip for continuous actions
+        ent_coef=0.005,       # less entropy for continuous (Gaussian)
         vf_coef=0.5,
         max_grad_norm=0.5,
         seed=SEED,
         device=device,
         verbose=1,
         policy_kwargs=dict(
-            net_arch=dict(pi=[512, 512, 256], vf=[512, 512, 256]),
-            log_std_init=-1.0,
+            net_arch=dict(pi=[256, 256, 128], vf=[256, 256, 128]),
+            log_std_init=-1.0,  # start with lower exploration noise
         ),
     )
     n_params = sum(p.numel() for p in model.policy.parameters())
     buf = 4096 * NUM_ENVS
-    log.info(f"PPO on {model.device} — {n_params:,} params, "
-             f"buffer {buf:,}/rollout")
+    log.info(f"PPO on {model.device} — {n_params:,} params, buffer {buf:,}/rollout")
 
     # ── Train ───────────────────────────────────────────────────────────────
     tracker = PortfolioTracker(run_dir)
     log.info(f"Starting training: {TOTAL_TIMESTEPS:,} timesteps...")
     t0 = time.time()
-    model.learn(total_timesteps=TOTAL_TIMESTEPS,
-                callback=[tracker], progress_bar=True)
+    model.learn(total_timesteps=TOTAL_TIMESTEPS, callback=[tracker], progress_bar=True)
     elapsed = time.time() - t0
     vec_env.close()
     tracker._export()
 
     fps = TOTAL_TIMESTEPS / elapsed
-    final_avg = (np.mean(tracker.ep_rewards[-100:])
-                 if len(tracker.ep_rewards) >= 100 else 0.0)
+    final_avg = np.mean(tracker.ep_rewards[-100:]) if len(tracker.ep_rewards) >= 100 else 0.0
     log.info(f"Training complete — {elapsed/60:.1f} min, {fps:,.0f} FPS")
     log.info(f"  Episodes : {len(tracker.ep_rewards):,}")
     log.info(f"  Final R  : {final_avg:+.4f}")
@@ -748,79 +654,75 @@ def main():
     model.save(run_dir / "nepserl_portfolio_model.zip")
     log.info(f"Model saved: {run_dir / 'nepserl_portfolio_model.zip'}")
 
-    plot_dashboard(tracker, run_dir, TOTAL_TIMESTEPS, NUM_ENVS, SPLIT_DATE)
+    plot_dashboard(tracker, run_dir, TOTAL_TIMESTEPS, NUM_ENVS)
     log.info("Training dashboard saved")
 
-    # ── OOS Evaluation (post-split, locked universe) ────────────────────────
-    log.info("=" * 70)
-    log.info("OUT-OF-SAMPLE EVALUATION")
-    log.info(f"  Universe : {EVAL_UNIVERSE}")
-    log.info(f"  Start    : {split_actual} (idx {split_index})")
-    log.info(f"  Duration : {min(EPISODE_LENGTH, oos_days - 1)} days")
-    log.info("=" * 70)
-
-    traj = evaluate_portfolio(
-        model, ticker_arrays, valid_start_idx, dates_array,
-        all_tickers=tickers, split_index=split_index,
-        eval_universe=EVAL_UNIVERSE,
-        n_assets=N_ASSETS, episode_length=min(EPISODE_LENGTH, oos_days - 1))
+    # ── Deterministic portfolio evaluation ──────────────────────────────────
+    log.info("Running deterministic portfolio evaluation...")
+    traj = evaluate_portfolio(model, ticker_arrays, valid_start_idx,
+                              dates_array, universe, EPISODE_LENGTH)
     traj.to_csv(run_dir / "eval_portfolio.csv", index=False)
 
     pv = traj["portfolio_value"].values
     agent_ret = pv[-1] / pv[0] - 1.0
     pv_rets = np.diff(pv) / (pv[:-1] + 1e-10)
-    sharpe  = (np.mean(pv_rets) / (np.std(pv_rets) + 1e-10)
-               * np.sqrt(252))
+    sharpe  = np.mean(pv_rets) / (np.std(pv_rets) + 1e-10) * np.sqrt(252)
     cummax  = np.maximum.accumulate(pv)
     max_dd  = np.max((cummax - pv) / (cummax + 1e-10))
 
     # Equal-weight B&H benchmark
     n = len(traj)
     bh_pv = np.ones(n)
-    for tk in EVAL_UNIVERSE:
+    valid_bh = 0
+    for tk in universe:
         col = f"close_{tk}"
         if col in traj.columns:
             cl = traj[col].values
             if cl[0] > 0 and not np.isnan(cl[0]):
-                bh_pv += (cl / cl[0] - 1.0) / len(EVAL_UNIVERSE)
+                bh_pv += (cl / cl[0] - 1.0) / len(universe)
+                valid_bh += 1
     bh_ret = bh_pv[-1] / bh_pv[0] - 1.0
 
+    # Per-asset weight analysis
+    log.info("=" * 70)
+    log.info("PORTFOLIO EVALUATION RESULTS")
     log.info(f"  Agent Return   : {agent_ret:+.2%}")
     log.info(f"  EW B&H Return  : {bh_ret:+.2%}")
     log.info(f"  Excess Return  : {agent_ret - bh_ret:+.2%}")
     log.info(f"  Sharpe Ratio   : {sharpe:+.2f}")
     log.info(f"  Max Drawdown   : {max_dd:.2%}")
 
+    # Average weight per asset
     log.info("  Avg Weights:")
-    avg_cash = (traj["cash_weight"].mean()
-                if "cash_weight" in traj.columns else 0.0)
+    avg_cash = traj["cash_weight"].mean() if "cash_weight" in traj.columns else 0.0
     log.info(f"    Cash       : {avg_cash:.1%}")
-    for tk in EVAL_UNIVERSE:
+    for tk in universe:
         col = f"w_{tk}"
         if col in traj.columns:
-            log.info(f"    {tk:>8s}   : {traj[col].mean():.1%}")
+            avg_w = traj[col].mean()
+            log.info(f"    {tk:>8s}   : {avg_w:.1%}")
 
+    # Individual asset B&H comparison
     log.info("  Per-Asset B&H:")
-    for tk in EVAL_UNIVERSE:
+    per_asset = []
+    for tk in universe:
         col = f"close_{tk}"
         if col in traj.columns:
             cl = traj[col].values
             if cl[0] > 0 and not np.isnan(cl[0]) and not np.isnan(cl[-1]):
                 bh = cl[-1] / cl[0] - 1.0
                 log.info(f"    {tk:>8s}   : {bh:+.2%}")
+                per_asset.append({"ticker": tk, "bh_return": bh})
     log.info("=" * 70)
 
-    plot_portfolio_equity(traj, EVAL_UNIVERSE, run_dir, SPLIT_DATE)
+    # ── Plots ───────────────────────────────────────────────────────────────
+    plot_portfolio_equity(traj, universe, run_dir)
     log.info("Portfolio equity plot saved")
 
     # ── Summary CSV ─────────────────────────────────────────────────────────
     summary = {
         "metric": [
-            "version", "split_date", "split_index",
-            "train_start", "train_end", "train_range_days",
-            "eval_start", "eval_days", "eval_universe",
-            "total_episodes", "total_timesteps", "training_fps",
-            "wall_time_min",
+            "total_episodes", "total_timesteps", "training_fps", "wall_time_min",
             "final_avg_reward_100", "best_avg_reward_100",
             "num_envs", "batch_size", "n_steps", "network",
             "obs_dim", "act_dim", "n_assets",
@@ -829,28 +731,19 @@ def main():
             "device", "gpu",
         ],
         "value": [
-            "v10_conviction_expansion",
-            SPLIT_DATE, split_index,
-            min_date, max_date, train_range_days,
-            split_actual,
-            min(EPISODE_LENGTH, oos_days - 1),
-            ",".join(EVAL_UNIVERSE),
             len(tracker.ep_rewards),
             tracker.ep_ts[-1] if tracker.ep_ts else 0,
             f"{fps:,.0f}", f"{elapsed/60:.1f}",
             f"{final_avg:+.4f}", f"{tracker._best_avg:+.4f}",
-            NUM_ENVS, 4096, 4096, "[512,512,256]x2",
-            obs_dim, act_dim, N_ASSETS,
-            f"{agent_ret:+.4f}", f"{bh_ret:+.4f}",
-            f"{agent_ret - bh_ret:+.4f}",
+            NUM_ENVS, 2048, 4096, "[256,256,128]x2",
+            obs_dim, act_dim, n_assets,
+            f"{agent_ret:+.4f}", f"{bh_ret:+.4f}", f"{agent_ret - bh_ret:+.4f}",
             f"{sharpe:+.2f}", f"{max_dd:.4f}", f"{avg_cash:.4f}",
             device,
-            (torch.cuda.get_device_name(0)
-             if torch.cuda.is_available() else "N/A"),
+            torch.cuda.get_device_name(0) if torch.cuda.is_available() else "N/A",
         ],
     }
-    pd.DataFrame(summary).to_csv(
-        run_dir / "summary_metrics.csv", index=False)
+    pd.DataFrame(summary).to_csv(run_dir / "summary_metrics.csv", index=False)
     log.info(f"All results saved in: {run_dir.resolve()}")
     log.info("DONE")
 

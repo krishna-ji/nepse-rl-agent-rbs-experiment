@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-NEPSE RL Hyper-Scale Stochastic Pullback Engine  v3
+NEPSE RL Hyper-Scale Stochastic Pullback Engine  v5
 ====================================================
 Single-file PPO trading engine exploiting full hardware:
   - 32 CPU cores via SubprocVecEnv (GIL bypass)
@@ -8,13 +8,14 @@ Single-file PPO trading engine exploiting full hardware:
   - 128 GB RAM — full OHLCV manifold as contiguous NumPy arrays
   - 5M timesteps with linear LR decay (1e-4 -> 1e-5)
 
-v3 changes:
-  1. Regime-gated opportunity cost (penalize cash only in bull + rising market)
-  2. Localized Drawdown Velocity feature (DD_state_t)
-  3. Macro regime + DD_state in observation space (9 dims)
-  4. Balanced KAPPA=0.015, GAMMA_DD=4.0 for 35-65% market exposure target
-  5. 32 SubprocVecEnv workers (one per logical CPU core)
-  6. LR floor at 1e-5 (prevents late-training stagnation)
+v5 — Orthogonal State Tensor (12 Dimensions):
+  1. Micro-Structure: CLV [-1,1], Lower Wick Exhaustion [0,3]
+  2. Momentum: Stochastic %K/%D (zero-centered) [-1,1]
+  3. Volatility: NATR (Z-scored 100d) [-3,3], Bollinger %B [0,1]
+  4. Liquidity: CMF-20 [-1,1]
+  5. Structural Proximity: D_low/ATR [-3,3], DD_depth/ATR [0,5]
+  6. Trend Topology: Ribbon Alignment [-1,1], Ribbon Dispersion [-3,3]
+  + position flag = 12 dims total
 """
 
 import warnings; warnings.filterwarnings("ignore")
@@ -137,6 +138,10 @@ def _stochastic(h, l, c, kp=14, dp=3):
 def _bbw(c, n=20, ns=2.0):
     s_ = _sma(c, n); std = c.rolling(n, min_periods=n).std()
     return ((s_ + ns*std) - (s_ - ns*std)) / (s_ + 1e-10)
+def _bb_pctb(c, n=20, ns=2.0):
+    s_ = _sma(c, n); std = c.rolling(n, min_periods=n).std()
+    upper = s_ + ns*std; lower = s_ - ns*std
+    return ((c - lower) / (upper - lower + 1e-10)).clip(0.0, 1.0)
 def _psl(l, w=60): return l.rolling(w, min_periods=w).min()
 
 def compute_features(master_df, valid_start_dates, log):
@@ -149,35 +154,49 @@ def compute_features(master_df, valid_start_dates, log):
         o, h, l, c, v = raw["Open"], raw["High"], raw["Low"], raw["Close"], raw["Volume"]
         pieces[(tk,"open")] = o; pieces[(tk,"high")] = h; pieces[(tk,"low")] = l
         pieces[(tk,"close")] = c; pieces[(tk,"volume")] = v
-        sma50, sma200, psl_ = _sma(c,50), _sma(c,200), _psl(l,60)
-        pieces[(tk,"sma50")] = sma50; pieces[(tk,"sma200")] = sma200
-        pieces[(tk,"macro_trend")] = (sma50 > sma200).astype(np.float32)
+        atr14 = _atr(h, l, c, 14)
+        pieces[(tk,"atr14")] = atr14
+        psl_ = _psl(l, 60)
         pieces[(tk,"protected_swing_low")] = psl_
-        pieces[(tk,"d_low")] = (c - psl_) / (c + 1e-10)
+        # SMAs for ribbon topology
+        sma10, sma20, sma50 = _sma(c, 10), _sma(c, 20), _sma(c, 50)
+        sma100, sma200 = _sma(c, 100), _sma(c, 200)
+        # 1. Micro-Structure
+        pieces[(tk,"clv")] = ((c - l) - (h - c)) / (h - l + 1e-10)          # CLV ∈ [-1, 1]
+        pieces[(tk,"wick_exhaust")] = ((c - l) / (atr14 + 1e-10)).clip(0.0, 3.0)
+        # 2. Momentum (zero-centered stochastic)
         pk, pd_ = _stochastic(h, l, c)
         pieces[(tk,"pct_k")] = (pk / 50.0) - 1.0
         pieces[(tk,"pct_d")] = (pd_ / 50.0) - 1.0
-        pieces[(tk,"delta_k")] = (pk - pk.shift(1)) / 50.0
-        atr14 = _atr(h, l, c, 14)
-        pieces[(tk,"atr14")] = atr14
-        pieces[(tk,"natr")] = atr14 / (c + 1e-10)
-        pieces[(tk,"bbw")] = _bbw(c, 20, 2.0)
-        # Localized Drawdown Velocity (20-bar rolling high)
+        # 3. Volatility Regime
+        pieces[(tk,"natr")] = atr14 / (c + 1e-10)               # Z-scored later (100d)
+        pieces[(tk,"bb_pctb")] = _bb_pctb(c, 20, 2.0)           # %B ∈ [0, 1]
+        # 4. Liquidity & Conviction — CMF-20 ∈ [-1, 1]
+        mf_mult = ((c - l) - (h - c)) / (h - l + 1e-10)
+        mf_vol  = mf_mult * v
+        cmf_20  = mf_vol.rolling(20, min_periods=20).sum() / (v.rolling(20, min_periods=20).sum() + 1e-10)
+        pieces[(tk,"cmf")] = cmf_20.clip(-1.0, 1.0)
+        # 5. Structural Proximity (ATR-normalized)
+        pieces[(tk,"d_low")] = ((c - psl_) / (atr14 + 1e-10)).clip(-3.0, 3.0)
         rolling_high_20 = h.rolling(20, min_periods=20).max()
-        pieces[(tk,"dd_state")] = ((rolling_high_20 - c) / (rolling_high_20 + 1e-10)).clip(0.0, 1.0)
+        pieces[(tk,"dd_depth")] = ((rolling_high_20 - c) / (atr14 + 1e-10)).clip(0.0, 5.0)
+        # 6. Trend Topology — Ribbon matrices
+        bull_count = ((sma10 > sma20).astype(float) + (sma20 > sma50).astype(float) +
+                      (sma50 > sma100).astype(float) + (sma100 > sma200).astype(float))
+        pieces[(tk,"ribbon_align")] = bull_count / 4.0 * 2.0 - 1.0    # ∈ [-1, 1]
+        pieces[(tk,"ribbon_disp")] = ((sma10 - sma200) / (sma200 + 1e-10) * 10.0).clip(-3.0, 3.0)
 
     feat_df = pd.DataFrame(pieces)
     feat_df.columns = pd.MultiIndex.from_tuples(feat_df.columns, names=["Ticker","Feature"])
     feat_df = feat_df.sort_index()
 
     for tk in all_tkrs:
-        for col in ["natr", "bbw", "d_low"]:
-            key = (tk, col)
-            if key not in feat_df.columns: continue
-            clean = feat_df[key].dropna()
-            rm = clean.rolling(252, min_periods=252).mean()
-            rs = clean.rolling(252, min_periods=252).std()
-            feat_df[key] = ((clean - rm) / (rs + 1e-8)).clip(-3.0, 3.0)
+        key = (tk, "natr")
+        if key not in feat_df.columns: continue
+        clean = feat_df[key].dropna()
+        rm = clean.rolling(100, min_periods=100).mean()
+        rs = clean.rolling(100, min_periods=100).std()
+        feat_df[key] = ((clean - rm) / (rs + 1e-8)).clip(-3.0, 3.0)
 
     log.info(f"Feature matrix: {feat_df.shape} — all scaled to [-1, +1]")
     return feat_df
@@ -186,7 +205,8 @@ def compute_features(master_df, valid_start_dates, log):
 # PRE-COMPILE NUMPY ARRAYS  (RAM exploitation — zero Pandas in step())
 # ============================================================================
 
-OBS_FEATURES = ["pct_k", "pct_d", "natr", "bbw", "d_low", "dd_state", "macro_trend"]
+OBS_FEATURES = ["clv", "wick_exhaust", "pct_k", "pct_d", "natr", "bb_pctb", "cmf",
+                "d_low", "dd_depth", "ribbon_align", "ribbon_disp"]
 NEEDED_COLS  = OBS_FEATURES + ["close", "high", "low", "atr14", "protected_swing_low"]
 
 def precompile_arrays(feat_df, tickers, valid_start_dates, log):
@@ -241,8 +261,8 @@ class NepseHyperEnv(gym.Env):
         self._tickers = tickers
         self._ep_len  = episode_length
         self.action_space = spaces.Discrete(2)
-        # 9 dims: pct_k, pct_d, natr, bbw, d_low, dd_state, macro_trend, position, peak_dd
-        self.observation_space = spaces.Box(-3.0, 3.0, shape=(9,), dtype=np.float32)
+        # 12 dims: clv, wick_exhaust, pct_k, pct_d, natr, bb_pctb, cmf, d_low, dd_depth, ribbon_align, ribbon_disp, position
+        self.observation_space = spaces.Box(-3.0, 5.0, shape=(12,), dtype=np.float32)
         self._rng = np.random.default_rng(seed)
         self._tk = ""; self._si = 0; self._t = 0
         self._pos = 0; self._entry = 0.0; self._peak = 0.0; self._pv = 1.0
@@ -301,10 +321,10 @@ class NepseHyperEnv(gym.Env):
             self._entry = 0.0; self._peak = 0.0; self._sells += 1
 
         else:
-            # HOLD CASH — regime-gated opportunity cost
+            # HOLD CASH — regime-gated opportunity cost (ribbon alignment)
             delta = np.log(close_t / (prev_c + 1e-10))
-            macro = float(c["macro_trend"][i])
-            if delta > 0 and (not np.isnan(macro) and macro > 0.5):
+            ribbon = float(c["ribbon_align"][i])
+            if delta > 0 and (not np.isnan(ribbon) and ribbon > 0):
                 reward -= self.OC_SCALE * delta
 
         self._t += 1
@@ -316,14 +336,10 @@ class NepseHyperEnv(gym.Env):
     def _obs(self):
         c = self._ta[self._tk]
         i = min(self._si + self._t, self._n - 1)
-        obs = np.zeros(9, dtype=np.float32)
+        obs = np.zeros(12, dtype=np.float32)
         for j, f in enumerate(OBS_FEATURES):
             v = c[f][i]; obs[j] = 0.0 if np.isnan(v) else float(v)
-        obs[7] = float(self._pos)
-        if self._pos == 1 and self._peak > 0:
-            cl = float(c["close"][i])
-            if not np.isnan(cl):
-                obs[8] = np.clip((self._peak - cl) / (self._peak + 1e-10), -1.0, 1.0)
+        obs[11] = float(self._pos)
         return np.nan_to_num(obs, nan=0.0, posinf=0.0, neginf=0.0)
 
     def _info(self):

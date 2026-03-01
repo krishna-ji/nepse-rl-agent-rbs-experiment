@@ -1,27 +1,26 @@
 #!/usr/bin/env python3
 """
-NEPSE RL Hyper-Scale Engine  v6 — Regime-Conditioned RL
-====================================================
-Single-file PPO trading engine exploiting full hardware:
-  - 32 CPU cores via SubprocVecEnv (GIL bypass)
-  - RTX 4060 (3072 CUDA cores, 8GB VRAM) — batch_size=2048
-  - 128 GB RAM — full OHLCV manifold as contiguous NumPy arrays
-  - 5M timesteps with linear LR decay (2e-4 -> 1e-5)
+NEPSE RL Portfolio Engine v8 — Alpha-Gradient Continuous Allocation
+======================================================================
+Single-file PPO engine trading a 10-asset NEPSE universe simultaneously.
+Instead of binary buy/sell on one ticker, the agent outputs a continuous
+Softmax weight vector [w_cash, w_1, ..., w_10] rebalancing the portfolio
+daily, paying friction only on the **turnover delta**.
 
-v6 — Regime-Conditioned 12-Dim Orthogonal State Tensor:
-  1. Micro-Structure: CLV [-1,1], Lower_Wick [0,3]
-  2. Momentum: Stochastic %K/%D (zero-centered) [-1,1]
-  3. Volatility: NATR_ZScore (100d) [-3,3], BB_%B (2*pctb-1) [-3,3]
-  4. Liquidity: CMF-20 [-1,1]
-  5. Structural: D_low/ATR [-3,3], DD_state/ATR [0,5]
-  6. Trend Topology: Ribbon Alignment [-1,1], Ribbon Dispersion [-3,3]
-  + position flag = 12 dims total
+v8 changes (over v7):
+  - Forward-fill OHLCV data to eliminate NaN poisoning (fixes GBIME -100%)
+  - Alpha Gradient: R += 5× (portfolio_ret - EW_benchmark_ret)
+  - Softmax Temperature (τ=2.0): sharper conviction in allocations
+  - Deadband Filter (1%): ignore micro-rebalancing from exploration noise
+  - 10M training steps (2x v7)
 
-Reward Topology:
-  - Dynamic κ: κ_base * (1 - 0.5 * max(0, ribbon_align))
-    → halves DD penalty in confirmed bull trends
-  - OC: OC_base * δ * ribbon_align * (1 + max(0, CMF))
-    → scales with trend strength AND volume conviction
+Architecture:
+  - State: (10 assets × 11 features) + (11 current weights) = 121 dims
+  - Action: Box(-3, 3, shape=(11,)) → Softmax(×2.0 temp) → weights
+  - Reward: port_ret - τ×turnover + 5×(port_ret - ew_ret)
+
+Hardware: 32 CPU SubprocVecEnv, RTX 4060, 128 GB RAM
+Data: 325 NEPSE tickers for feature computation, 10-asset eval universe
 """
 
 import warnings; warnings.filterwarnings("ignore")
@@ -44,19 +43,23 @@ from typing import Callable
 # CONFIGURATION
 # ============================================================================
 
-NUM_ENVS        = 32           # One per logical CPU core
-TOTAL_TIMESTEPS = 5_000_000    # 5x previous
-EPISODE_LENGTH  = 252          # 1 trading year
+NUM_ENVS        = 32
+TOTAL_TIMESTEPS = 10_000_000
+EPISODE_LENGTH  = 252
 MIN_ROWS        = 250
 WARMUP          = 200
 SEED            = 42
+
+# Fixed 10-asset universe (same tickers used in all prior OOS evaluations)
+UNIVERSE = ["NABIL", "NICA", "SHIVM", "CHDC", "NLIC",
+            "UPPER", "NRIC", "SBL", "GBIME", "SANIMA"]
+N_ASSETS = len(UNIVERSE)
 
 # ============================================================================
 # SETUP
 # ============================================================================
 
 def setup():
-    """Setup run directory, logger, device."""
     RUN_TS  = f"{datetime.datetime.now():%Y%m%d_%H%M%S}"
     RUN_DIR = pathlib.Path(f"runs/{RUN_TS}")
     RUN_DIR.mkdir(parents=True, exist_ok=True)
@@ -68,20 +71,18 @@ def setup():
     log.handlers.clear()
     fmt = logging.Formatter("%(asctime)s | %(levelname)-7s | %(message)s", datefmt="%H:%M:%S")
     sh = logging.StreamHandler(); sh.setLevel(logging.INFO); sh.setFormatter(fmt); log.addHandler(sh)
-    fh = logging.FileHandler(RUN_DIR / "nepserl_hyperscale.log", encoding="utf-8")
+    fh = logging.FileHandler(RUN_DIR / "nepserl_portfolio.log", encoding="utf-8")
     fh.setLevel(logging.DEBUG); fh.setFormatter(fmt); log.addHandler(fh)
 
-    log.info("NEPSE RL Hyper-Scale Engine")
+    log.info("NEPSE RL Portfolio Engine v8 (Alpha-Gradient + Temperature + Deadband)")
     log.info(f"Run dir  : {RUN_DIR.resolve()}")
-    log.info(f"Data dir : {DATA_DIR.resolve()}")
     log.info(f"Device   : {DEVICE}")
     if DEVICE == "cuda":
         p = torch.cuda.get_device_properties(0)
         log.info(f"GPU      : {p.name}  ({p.multi_processor_count * 128} CUDA cores, "
                  f"{p.total_memory / 1024**3:.1f} GB VRAM)")
     log.info(f"CPU cores: {multiprocessing.cpu_count()}")
-    log.info(f"Envs     : {NUM_ENVS}")
-
+    log.info(f"Universe : {UNIVERSE}")
     return log, RUN_DIR, DATA_DIR, DEVICE
 
 # ============================================================================
@@ -89,7 +90,6 @@ def setup():
 # ============================================================================
 
 def load_ohlcv(DATA_DIR, log):
-    """Load OHLCV CSVs → MultiIndex DataFrame + valid-start dates."""
     log.info("Loading OHLCV data...")
     frames, skipped = {}, 0
     for csv in sorted(DATA_DIR.glob("*.csv")):
@@ -114,7 +114,20 @@ def load_ohlcv(DATA_DIR, log):
     parts = {(tk, col): s.reindex(idx) for tk, df in frames.items() for col, s in df.items()}
     master_df = pd.DataFrame(parts)
     master_df.columns = pd.MultiIndex.from_tuples(master_df.columns, names=["Ticker","Feature"])
-    log.info(f"Master DataFrame: {master_df.shape}")
+
+    # Forward-fill OHLCV to eliminate NaN gaps (e.g. GBIME has 59% NaN after
+    # reindex to master dates). If a stock didn't trade, last known price persists.
+    # Only fill within each ticker's actual date range (don't fill before IPO).
+    for tk in frames:
+        first_valid = frames[tk].index[0]
+        last_valid  = frames[tk].index[-1]
+        mask = (master_df.index >= first_valid) & (master_df.index <= last_valid)
+        for col in ["Open", "High", "Low", "Close", "Volume"]:
+            key = (tk, col)
+            if key in master_df.columns:
+                master_df.loc[mask, key] = master_df.loc[mask, key].ffill()
+    ffill_nans = master_df.isna().sum().sum()
+    log.info(f"Master DataFrame: {master_df.shape} (remaining NaN after ffill: {ffill_nans:,})")
 
     valid_start_dates = {}
     for tk in master_df.columns.get_level_values("Ticker").unique():
@@ -126,7 +139,7 @@ def load_ohlcv(DATA_DIR, log):
     return master_df, valid_start_dates, tickers
 
 # ============================================================================
-# FEATURE ENGINEERING  (all features scaled to [-1, +1])
+# FEATURE ENGINEERING
 # ============================================================================
 
 def _sma(s, n):       return s.rolling(n, min_periods=n).mean()
@@ -141,9 +154,6 @@ def _stochastic(h, l, c, kp=14, dp=3):
     pk = raw_k.rolling(dp, min_periods=dp).mean()
     pd_ = pk.rolling(dp, min_periods=dp).mean()
     return pk, pd_
-def _bbw(c, n=20, ns=2.0):
-    s_ = _sma(c, n); std = c.rolling(n, min_periods=n).std()
-    return ((s_ + ns*std) - (s_ - ns*std)) / (s_ + 1e-10)
 def _bb_pctb(c, n=20, ns=2.0):
     s_ = _sma(c, n); std = c.rolling(n, min_periods=n).std()
     upper = s_ + ns*std; lower = s_ - ns*std
@@ -151,7 +161,6 @@ def _bb_pctb(c, n=20, ns=2.0):
 def _psl(l, w=60): return l.rolling(w, min_periods=w).min()
 
 def compute_features(master_df, valid_start_dates, log):
-    """Compute features with fixed scaling [-1, +1]."""
     all_tkrs = master_df.columns.get_level_values("Ticker").unique()
     log.info(f"Computing features for {len(all_tkrs)} tickers...")
     pieces = {}
@@ -164,32 +173,25 @@ def compute_features(master_df, valid_start_dates, log):
         pieces[(tk,"atr14")] = atr14
         psl_ = _psl(l, 60)
         pieces[(tk,"protected_swing_low")] = psl_
-        # SMAs for ribbon topology
         sma10, sma20, sma50 = _sma(c, 10), _sma(c, 20), _sma(c, 50)
         sma100, sma200 = _sma(c, 100), _sma(c, 200)
-        # 1. Micro-Structure
-        pieces[(tk,"clv")] = ((c - l) - (h - c)) / (h - l + 1e-10)          # CLV ∈ [-1, 1]
+        pieces[(tk,"clv")] = ((c - l) - (h - c)) / (h - l + 1e-10)
         pieces[(tk,"lower_wick")] = ((c - l) / (atr14 + 1e-10)).clip(0.0, 3.0)
-        # 2. Momentum (zero-centered stochastic)
         pk, pd_ = _stochastic(h, l, c)
         pieces[(tk,"pct_k")] = (pk / 50.0) - 1.0
         pieces[(tk,"pct_d")] = (pd_ / 50.0) - 1.0
-        # 3. Volatility Regime
-        pieces[(tk,"natr")] = atr14 / (c + 1e-10)               # Z-scored later (100d)
-        pieces[(tk,"bb_pctb")] = _bb_pctb(c, 20, 2.0)           # %B ∈ [-3, 3]
-        # 4. Liquidity & Conviction — CMF-20 ∈ [-1, 1]
+        pieces[(tk,"natr")] = atr14 / (c + 1e-10)
+        pieces[(tk,"bb_pctb")] = _bb_pctb(c, 20, 2.0)
         mf_mult = ((c - l) - (h - c)) / (h - l + 1e-10)
         mf_vol  = mf_mult * v
         cmf_20  = mf_vol.rolling(20, min_periods=20).sum() / (v.rolling(20, min_periods=20).sum() + 1e-10)
         pieces[(tk,"cmf")] = cmf_20.clip(-1.0, 1.0)
-        # 5. Structural Proximity (ATR-normalized)
         pieces[(tk,"d_low")] = ((c - psl_) / (atr14 + 1e-10)).clip(-3.0, 3.0)
         rolling_high_20 = h.rolling(20, min_periods=20).max()
         pieces[(tk,"dd_state")] = ((rolling_high_20 - c) / (atr14 + 1e-10)).clip(0.0, 5.0)
-        # 6. Trend Topology — Ribbon matrices
         bull_count = ((sma10 > sma20).astype(float) + (sma20 > sma50).astype(float) +
                       (sma50 > sma100).astype(float) + (sma100 > sma200).astype(float))
-        pieces[(tk,"ribbon_align")] = bull_count / 4.0 * 2.0 - 1.0    # ∈ [-1, 1]
+        pieces[(tk,"ribbon_align")] = bull_count / 4.0 * 2.0 - 1.0
         pieces[(tk,"ribbon_disp")] = ((sma10 - sma200) / (sma200 + 1e-10) * 10.0).clip(-3.0, 3.0)
 
     feat_df = pd.DataFrame(pieces)
@@ -204,22 +206,21 @@ def compute_features(master_df, valid_start_dates, log):
         rs = clean.rolling(100, min_periods=100).std()
         feat_df[key] = ((clean - rm) / (rs + 1e-8)).clip(-3.0, 3.0)
 
-    log.info(f"Feature matrix: {feat_df.shape} — all scaled to [-1, +1]")
+    log.info(f"Feature matrix: {feat_df.shape}")
     return feat_df
 
 # ============================================================================
-# PRE-COMPILE NUMPY ARRAYS  (RAM exploitation — zero Pandas in step())
+# PRE-COMPILE NUMPY ARRAYS
 # ============================================================================
 
 OBS_FEATURES = ["clv", "lower_wick", "pct_k", "pct_d", "natr", "bb_pctb", "cmf",
                 "d_low", "dd_state", "ribbon_align", "ribbon_disp"]
+N_FEATURES   = len(OBS_FEATURES)      # 11 per asset
 NEEDED_COLS  = OBS_FEATURES + ["close", "high", "low", "atr14", "protected_swing_low"]
 
 def precompile_arrays(feat_df, tickers, valid_start_dates, log):
-    """Convert Pandas manifold to contiguous float32 arrays for O(1) access."""
     dates_array = feat_df.index.values
     n_dates = len(dates_array)
-
     ticker_arrays = {}
     for tk in tickers:
         arrays = {}
@@ -241,139 +242,149 @@ def precompile_arrays(feat_df, tickers, valid_start_dates, log):
     return ticker_arrays, valid_start_idx, dates_array, n_dates
 
 # ============================================================================
-# GYMNASIUM ENVIRONMENT — Autonomous Exit Policy
+# PORTFOLIO ENVIRONMENT — Continuous Softmax Allocation
 # ============================================================================
 #
-# v6 Regime-Conditioned Reward Topology:
-#   - Dynamic κ: κ_base * (1 - 0.5 * max(0, ribbon_align))
-#     → halves DD penalty during confirmed bull trends (ribbon_align = +1)
-#   - OC: OC_base * δ * ribbon_align * (1 + max(0, CMF))
-#     → opportunity cost scales with trend strength AND volume conviction
-#   - Pure NumPy step() — no Pandas in the hot path
+# State:  [asset_1_features(11), ..., asset_10_features(11), w_cash, w_1, ..., w_10]
+#         = 10×11 + 11 = 121 dims
+# Action: Box(-3, 3, shape=(11,)) → Softmax → [w_cash, w_1, ..., w_10]
+# Reward: ln(PV_t / PV_{t-1}) - τ × Turnover
 
-class NepseHyperEnv(gym.Env):
-    TAU       = 0.005      # ~0.5% realistic NEPSE broker fees
-    KAPPA_BASE = 0.002     # base drawdown penalty coefficient
-    GAMMA_DD  = 0.4        # exponential curvature (scaled for ATR-normalized DD ∈ [0,5])
-    OC_BASE   = 0.30       # base opportunity cost of cash
+class NepsePortfolioEnv(gym.Env):
+    TAU         = 0.005    # 0.5% per unit of turnover (one-way)
+    ALPHA_SCALE = 5.0      # Alpha Gradient: reward bonus for beating EW benchmark
+    TEMPERATURE = 2.0      # Softmax temperature: sharper conviction
+    DEADBAND    = 0.01     # Ignore weight shifts < 1% (silence exploration noise)
 
     def __init__(self, ticker_arrays, valid_start_idx, dates_array,
-                 tickers, episode_length=252, seed=None):
+                 universe, episode_length=252, seed=None):
         super().__init__()
         self._ta    = ticker_arrays
         self._vsi   = valid_start_idx
         self._dates = dates_array
         self._n     = len(dates_array)
-        self._tickers = tickers
+        self._universe = universe
+        self._n_assets = len(universe)
         self._ep_len  = episode_length
-        self.action_space = spaces.Discrete(2)
-        # 12 dims: clv, lower_wick, pct_k, pct_d, natr, bb_pctb, cmf, d_low, dd_state, ribbon_align, ribbon_disp, position
-        self.observation_space = spaces.Box(-3.0, 5.0, shape=(12,), dtype=np.float32)
+
+        obs_dim = self._n_assets * N_FEATURES + (self._n_assets + 1)  # 110 + 11 = 121
+        self.observation_space = spaces.Box(-5.0, 5.0, shape=(obs_dim,), dtype=np.float32)
+        self.action_space = spaces.Box(-3.0, 3.0, shape=(self._n_assets + 1,), dtype=np.float32)
+
         self._rng = np.random.default_rng(seed)
-        self._tk = ""; self._si = 0; self._t = 0
-        self._pos = 0; self._entry = 0.0; self._peak = 0.0; self._pv = 1.0
-        self._buys = 0; self._sells = 0
+        self._weights = np.zeros(self._n_assets + 1, dtype=np.float32)  # [cash, a1..a10]
+        self._si = 0; self._t = 0; self._pv = 1.0
+
+    def _softmax(self, x):
+        e = np.exp(x - np.max(x))
+        return e / (e.sum() + 1e-10)
 
     def reset(self, *, seed=None, options=None):
         super().reset(seed=seed)
         if seed is not None:
             self._rng = np.random.default_rng(seed)
-        self._tk = self._rng.choice(self._tickers)
-        vs_idx = self._vsi[self._tk]
+
+        # Find a valid start index where ALL universe tickers have data
+        latest_start = max(self._vsi.get(tk, 0) for tk in self._universe)
         last = self._n - self._ep_len
-        if last <= vs_idx: vs_idx = max(0, last - 1)
-        self._si = int(self._rng.integers(vs_idx, max(vs_idx + 1, last)))
-        self._t = 0; self._pos = 0; self._entry = 0.0; self._peak = 0.0
-        self._pv = 1.0; self._buys = 0; self._sells = 0
+        if last <= latest_start: latest_start = max(0, last - 1)
+        self._si = int(self._rng.integers(latest_start, max(latest_start + 1, last)))
+        self._t = 0; self._pv = 1.0
+        self._weights = np.zeros(self._n_assets + 1, dtype=np.float32)
+        self._weights[0] = 1.0  # start 100% cash
         return self._obs(), self._info()
 
     def step(self, action):
-        c = self._ta[self._tk]
         i = self._si + self._t
-        if i >= self._n:
+        if i >= self._n - 1:
             return self._obs(), 0.0, True, True, self._info()
 
-        close_t = float(c["close"][i])
-        prev_c  = float(c["close"][max(i - 1, 0)])
+        # ── Softmax Temperature: sharpen conviction ────────────────────────
+        sharpened = action.astype(np.float64) * self.TEMPERATURE
+        target_weights = self._softmax(sharpened).astype(np.float32)
 
-        if np.isnan(close_t) or np.isnan(prev_c):
-            self._t += 1
-            done = self._t >= self._ep_len
-            trunc = (self._si + self._t) >= self._n - 1
-            return self._obs(), 0.0, done, trunc, self._info()
+        # ── Deadband Filter: silence exploration noise micro-churning ──────
+        weight_delta = target_weights - self._weights
+        weight_delta = np.where(np.abs(weight_delta) < self.DEADBAND, 0.0, weight_delta)
+        executed_weights = self._weights + weight_delta
+        executed_weights = executed_weights / (executed_weights.sum() + 1e-10)  # re-normalize
 
-        reward = 0.0
+        # ── Turnover: computed on actually-executed weight changes ──────────
+        turnover = float(np.sum(np.abs(executed_weights - self._weights)))
+        friction = self.TAU * turnover
 
-        # Read precomputed regime features for reward conditioning
-        ribbon_val = float(c["ribbon_align"][i])
-        if np.isnan(ribbon_val): ribbon_val = 0.0
-        dd_state_val = float(c["dd_state"][i])
-        if np.isnan(dd_state_val): dd_state_val = 0.0
-        cmf_val = float(c["cmf"][i])
-        if np.isnan(cmf_val): cmf_val = 0.0
+        # ── Daily log returns per asset ────────────────────────────────────
+        returns = np.zeros(self._n_assets, dtype=np.float64)
+        for j, tk in enumerate(self._universe):
+            c_arr = self._ta[tk]["close"]
+            c_t   = float(c_arr[i + 1])
+            c_prev = float(c_arr[i])
+            if np.isnan(c_t) or np.isnan(c_prev) or c_prev < 1e-6:
+                returns[j] = 0.0
+            else:
+                returns[j] = np.log(c_t / c_prev)
 
-        if self._pos == 0 and action == 1:
-            # LONG ENTRY — pay transaction cost
-            self._pos = 1; self._entry = close_t; self._peak = close_t
-            reward -= self.TAU; self._buys += 1
+        # ── Portfolio return (weighted sum, cash earns 0) ──────────────────
+        port_return = 0.0
+        for j in range(self._n_assets):
+            port_return += self._weights[j + 1] * returns[j]
 
-        elif self._pos == 1 and action == 1:
-            # HOLD LONG — regime-conditioned drawdown penalty
-            self._peak = max(self._peak, close_t)
-            lr = np.log(close_t / (prev_c + 1e-10))
-            # Dynamic κ: reduce penalty in bull trends (ribbon_align > 0)
-            kappa_dyn = self.KAPPA_BASE * (1.0 - 0.5 * max(0.0, ribbon_val))
-            dd_penalty = kappa_dyn * (np.exp(self.GAMMA_DD * dd_state_val) - 1.0)
-            reward += lr - dd_penalty
-            self._pv *= np.exp(lr)
+        # ── Equal-Weight Benchmark return (the "1/N" baseline) ─────────────
+        ew_return = float(np.mean(returns))  # equal across all assets
+        active_return = port_return - ew_return
 
-        elif self._pos == 1 and action == 0:
-            # SELL (agent-initiated exit)
-            self._pos = 0
-            lr = np.log(close_t / (prev_c + 1e-10))
-            reward += lr - self.TAU
-            self._pv *= np.exp(lr - self.TAU)
-            self._entry = 0.0; self._peak = 0.0; self._sells += 1
+        # ── Reward Topology ────────────────────────────────────────────────
+        #  1) Absolute return (survive the market)
+        #  2) Turnover friction (don't churn)
+        #  3) Alpha Gradient: 5× bonus for beating EW benchmark
+        reward = port_return - friction + self.ALPHA_SCALE * active_return
 
-        else:
-            # HOLD CASH — regime + liquidity gated opportunity cost
-            delta = np.log(close_t / (prev_c + 1e-10))
-            if delta > 0 and ribbon_val > 0.0:
-                liq_mult = 1.0 + max(0.0, cmf_val)
-                reward -= self.OC_BASE * delta * ribbon_val * liq_mult
-
+        # ── Update portfolio value (actual PnL, no alpha bonus) ────────────
+        self._pv *= np.exp(port_return - friction)
+        self._weights = executed_weights
         self._t += 1
+
         done  = self._t >= self._ep_len
         trunc = (self._si + self._t) >= self._n - 1
         if np.isnan(reward) or np.isinf(reward): reward = 0.0
         return self._obs(), float(reward), done, trunc, self._info()
 
     def _obs(self):
-        c = self._ta[self._tk]
         i = min(self._si + self._t, self._n - 1)
-        obs = np.zeros(12, dtype=np.float32)
-        for j, f in enumerate(OBS_FEATURES):
-            v = c[f][i]; obs[j] = 0.0 if np.isnan(v) else float(v)
-        obs[11] = float(self._pos)
+        obs = np.zeros(self._n_assets * N_FEATURES + self._n_assets + 1, dtype=np.float32)
+
+        # Fill 11 features per asset
+        for j, tk in enumerate(self._universe):
+            c = self._ta[tk]
+            off = j * N_FEATURES
+            for k, f in enumerate(OBS_FEATURES):
+                v = c[f][i]
+                obs[off + k] = 0.0 if np.isnan(v) else float(v)
+
+        # Append current weights
+        off = self._n_assets * N_FEATURES
+        obs[off:off + self._n_assets + 1] = self._weights
+
         return np.nan_to_num(obs, nan=0.0, posinf=0.0, neginf=0.0)
 
     def _info(self):
-        c = self._ta[self._tk]
         i = min(self._si + self._t, self._n - 1)
-        return {
-            "ticker": self._tk, "date": self._dates[i],
-            "close": float(c["close"][i]),
-            "action": -1, "portfolio_value": float(self._pv),
-            "position": self._pos, "peak": float(self._peak),
-            "drawdown": max(0.0, (self._peak - float(c["close"][i])) / (self._peak + 1e-10))
-                        if self._pos == 1 and self._peak > 0 else 0.0,
+        info = {
+            "date": self._dates[i],
+            "portfolio_value": float(self._pv),
+            "cash_weight": float(self._weights[0]),
         }
+        for j, tk in enumerate(self._universe):
+            info[f"w_{tk}"] = float(self._weights[j + 1])
+            c_val = float(self._ta[tk]["close"][i])
+            info[f"close_{tk}"] = c_val if not np.isnan(c_val) else 0.0
+        return info
 
 # ============================================================================
 # TRAINING CALLBACK
 # ============================================================================
 
-class HyperScaleTracker(BaseCallback):
+class PortfolioTracker(BaseCallback):
     def __init__(self, run_dir, log_every=100):
         super().__init__(verbose=0)
         self.run_dir = pathlib.Path(run_dir)
@@ -442,54 +453,37 @@ class HyperScaleTracker(BaseCallback):
 # ============================================================================
 
 def linear_schedule(initial_value: float, final_value: float = 1e-5) -> Callable[[float], float]:
-    """Linear decay from initial_value to final_value as training progresses."""
     def func(progress_remaining: float) -> float:
         return final_value + progress_remaining * (initial_value - final_value)
     return func
 
 # ============================================================================
-# EVALUATION
+# DETERMINISTIC PORTFOLIO EVALUATION
 # ============================================================================
 
-def evaluate_ticker(model, ticker, ticker_arrays, valid_start_idx,
-                    dates_array, tickers_list, episode_length=252, seed=123):
-    """Deterministic evaluation on a single ticker."""
-    env = NepseHyperEnv(ticker_arrays, valid_start_idx, dates_array,
-                        tickers_list, episode_length=episode_length, seed=seed)
+def evaluate_portfolio(model, ticker_arrays, valid_start_idx, dates_array,
+                       universe, episode_length=252, seed=123):
+    """Deterministic evaluation across the full 10-asset universe."""
+    env = NepsePortfolioEnv(ticker_arrays, valid_start_idx, dates_array,
+                            universe, episode_length=episode_length, seed=seed)
     obs, info = env.reset()
-    env._tk = ticker; env._si = valid_start_idx[ticker]
-    env._t = 0; env._pos = 0; env._entry = 0.0; env._peak = 0.0; env._pv = 1.0
+    # Fix start to latest valid start
+    latest_start = max(valid_start_idx.get(tk, 0) for tk in universe)
+    env._si = latest_start; env._t = 0; env._pv = 1.0
+    env._weights = np.zeros(len(universe) + 1, dtype=np.float32)
+    env._weights[0] = 1.0
     obs = env._obs(); info = env._info()
 
     records = []
     done = False
     while not done:
         action, _ = model.predict(obs, deterministic=True)
-        action = int(action)
-        info["action"] = action
         records.append(info.copy())
         obs, reward, terminated, truncated, info = env.step(action)
         done = terminated or truncated
-    info["action"] = -1; records.append(info.copy())
+    records.append(info.copy())
     traj = pd.DataFrame(records)
-
-    pv = traj["portfolio_value"].values
-    cl = traj["close"].values
-    agent_ret = pv[-1] / pv[0] - 1.0
-    bh_ret    = cl[-1] / cl[0] - 1.0
-    pv_rets   = np.diff(pv) / pv[:-1]
-    sharpe    = np.mean(pv_rets) / (np.std(pv_rets) + 1e-10) * np.sqrt(252)
-    cummax    = np.maximum.accumulate(pv)
-    max_dd    = np.max((cummax - pv) / cummax)
-    actions   = traj["action"].values
-    n_total   = len(actions) - 1
-    buy_ratio = (actions[:-1] == 1).sum() / n_total if n_total > 0 else 0
-
-    return {
-        "ticker": ticker, "agent_return": agent_ret, "buyhold_return": bh_ret,
-        "excess_return": agent_ret - bh_ret, "sharpe_ratio": sharpe,
-        "max_drawdown": max_dd, "buy_ratio": buy_ratio, "final_pv": pv[-1],
-    }, traj
+    return traj
 
 # ============================================================================
 # PLOTS
@@ -497,7 +491,6 @@ def evaluate_ticker(model, ticker, ticker_arrays, valid_start_idx,
 
 def plot_dashboard(tracker, run_dir, total_ts, num_envs):
     fig, axes = plt.subplots(2, 2, figsize=(16, 10))
-
     ax = axes[0, 0]
     ax.plot(tracker.ep_ts, tracker.ep_rewards, alpha=0.15, color="dodgerblue", lw=0.5)
     if len(tracker.ep_rewards) > 100:
@@ -530,29 +523,49 @@ def plot_dashboard(tracker, run_dir, total_ts, num_envs):
     ax.set_xlabel("Timesteps"); ax.set_ylabel("Explained Var")
     ax.set_title("Value Function Quality"); ax.grid(alpha=0.3)
 
-    plt.suptitle(f"NEPSE RL Hyper-Scale — {total_ts/1e6:.0f}M steps, {num_envs} envs", fontsize=14)
+    plt.suptitle(f"NEPSE Portfolio v8 — {total_ts/1e6:.0f}M steps, {num_envs} envs", fontsize=14)
     plt.tight_layout()
     plt.savefig(run_dir / "training_dashboard.png", dpi=150, bbox_inches="tight")
     plt.close()
 
-def plot_equity_curves(all_trajs, run_dir):
-    n_plots = min(len(all_trajs), 10)
-    cols = 2; rows = (n_plots + 1) // 2
-    fig, axes = plt.subplots(rows, cols, figsize=(16, 4 * rows))
-    axes = axes.flatten() if n_plots > 1 else [axes]
-    for ix, (tk, traj) in enumerate(all_trajs.items()):
-        if ix >= n_plots: break
-        ax = axes[ix]
-        pv = traj["portfolio_value"].values; cl = traj["close"].values
-        bh = cl / cl[0]
-        ax.plot(pv, label=f"Agent ({pv[-1]-1:+.1%})", color="dodgerblue", lw=1.5)
-        ax.plot(bh, label=f"B&H ({bh[-1]-1:+.1%})", color="gray", lw=1, alpha=0.7)
-        ax.axhline(1.0, color="black", ls="--", alpha=0.3)
-        ax.set_title(tk, fontsize=12, fontweight="bold"); ax.legend(fontsize=8); ax.grid(alpha=0.3)
-    for ix in range(n_plots, len(axes)): axes[ix].set_visible(False)
-    plt.suptitle("Out-of-Sample Equity Curves: Agent vs Buy & Hold", fontsize=14)
+def plot_portfolio_equity(traj, universe, run_dir):
+    fig, axes = plt.subplots(2, 1, figsize=(16, 10))
+
+    # Top: Portfolio equity vs equal-weight B&H
+    ax = axes[0]
+    pv = traj["portfolio_value"].values
+    ax.plot(pv, label=f"Agent ({pv[-1]-1:+.1%})", color="dodgerblue", lw=2)
+
+    # Compute equal-weight B&H
+    n = len(traj)
+    bh_pv = np.ones(n)
+    for tk in universe:
+        col = f"close_{tk}"
+        if col in traj.columns:
+            cl = traj[col].values
+            if cl[0] > 0:
+                bh_pv += (cl / cl[0] - 1.0) / len(universe)
+    ax.plot(bh_pv, label=f"EW B&H ({bh_pv[-1]-1:+.1%})", color="gray", lw=1.5, alpha=0.7)
+    ax.axhline(1.0, color="black", ls="--", alpha=0.3)
+    ax.set_ylabel("Portfolio Value"); ax.set_title("Portfolio Equity: Agent vs Equal-Weight B&H")
+    ax.legend(); ax.grid(alpha=0.3)
+
+    # Bottom: Weight allocation over time (stacked area)
+    ax = axes[1]
+    weight_cols = ["cash_weight"] + [f"w_{tk}" for tk in universe]
+    labels = ["Cash"] + list(universe)
+    wdata = np.zeros((n, len(weight_cols)))
+    for j, col in enumerate(weight_cols):
+        if col in traj.columns:
+            wdata[:, j] = traj[col].values
+    ax.stackplot(range(n), wdata.T, labels=labels, alpha=0.8)
+    ax.set_ylabel("Weight"); ax.set_xlabel("Day")
+    ax.set_title("Portfolio Weight Allocation Over Time")
+    ax.legend(loc="upper left", fontsize=7, ncol=4); ax.grid(alpha=0.3)
+    ax.set_ylim(0, 1.05)
+
     plt.tight_layout()
-    plt.savefig(run_dir / "oos_equity_curves.png", dpi=150, bbox_inches="tight")
+    plt.savefig(run_dir / "portfolio_equity.png", dpi=150, bbox_inches="tight")
     plt.close()
 
 # ============================================================================
@@ -564,46 +577,65 @@ def main():
 
     # ── Data ────────────────────────────────────────────────────────────────
     master_df, valid_start_dates, tickers = load_ohlcv(data_dir, log)
+
+    # Verify all universe tickers exist
+    missing = [tk for tk in UNIVERSE if tk not in tickers]
+    if missing:
+        log.warning(f"Universe tickers missing from data: {missing}")
+        universe = [tk for tk in UNIVERSE if tk in tickers]
+    else:
+        universe = list(UNIVERSE)
+    log.info(f"Active universe: {universe} ({len(universe)} assets)")
+
     feat_df = compute_features(master_df, valid_start_dates, log)
     ticker_arrays, valid_start_idx, dates_array, n_dates = precompile_arrays(
         feat_df, tickers, valid_start_dates, log)
 
+    n_assets = len(universe)
+    obs_dim  = n_assets * N_FEATURES + (n_assets + 1)
+    act_dim  = n_assets + 1
+    log.info(f"Obs dim: {obs_dim} = {n_assets}×{N_FEATURES} + {n_assets+1}")
+    log.info(f"Act dim: {act_dim} = {n_assets} assets + cash")
+
     # ── SubprocVecEnv factory ───────────────────────────────────────────────
     def make_env(rank, seed=SEED):
         def _init():
-            return Monitor(NepseHyperEnv(
+            return Monitor(NepsePortfolioEnv(
                 ticker_arrays, valid_start_idx, dates_array,
-                tickers, episode_length=EPISODE_LENGTH, seed=seed + rank))
+                universe, episode_length=EPISODE_LENGTH, seed=seed + rank))
         return _init
 
     log.info(f"Spawning {NUM_ENVS} SubprocVecEnv workers...")
     vec_env = SubprocVecEnv([make_env(i) for i in range(NUM_ENVS)], start_method="spawn")
     log.info(f"SubprocVecEnv ready — {NUM_ENVS} workers active")
 
-    # ── PPO Model ───────────────────────────────────────────────────────────
+    # ── PPO Model (continuous actions) ──────────────────────────────────────
     model = PPO(
         "MlpPolicy", vec_env,
         learning_rate=linear_schedule(2e-4),
-        n_steps=4096,         # 4096 × 32 envs = 131,072 per rollout
-        batch_size=2048,      # smaller batches, more gradient updates per rollout
+        n_steps=4096,
+        batch_size=2048,
         n_epochs=10,
         gamma=0.995,
         gae_lambda=0.95,
-        clip_range=0.1,
-        ent_coef=0.015,
+        clip_range=0.2,       # wider clip for continuous actions
+        ent_coef=0.005,       # less entropy for continuous (Gaussian)
         vf_coef=0.5,
         max_grad_norm=0.5,
         seed=SEED,
         device=device,
         verbose=1,
-        policy_kwargs=dict(net_arch=dict(pi=[256, 256, 128], vf=[256, 256, 128])),
+        policy_kwargs=dict(
+            net_arch=dict(pi=[256, 256, 128], vf=[256, 256, 128]),
+            log_std_init=-1.0,  # start with lower exploration noise
+        ),
     )
     n_params = sum(p.numel() for p in model.policy.parameters())
     buf = 4096 * NUM_ENVS
     log.info(f"PPO on {model.device} — {n_params:,} params, buffer {buf:,}/rollout")
 
     # ── Train ───────────────────────────────────────────────────────────────
-    tracker = HyperScaleTracker(run_dir)
+    tracker = PortfolioTracker(run_dir)
     log.info(f"Starting training: {TOTAL_TIMESTEPS:,} timesteps...")
     t0 = time.time()
     model.learn(total_timesteps=TOTAL_TIMESTEPS, callback=[tracker], progress_bar=True)
@@ -618,78 +650,83 @@ def main():
     log.info(f"  Final R  : {final_avg:+.4f}")
     log.info(f"  Best R   : {tracker._best_avg:+.4f}")
 
-    model.save(run_dir / "nepserl_hyperscale_model.zip")
-    log.info(f"Model saved: {run_dir / 'nepserl_hyperscale_model.zip'}")
+    model.save(run_dir / "nepserl_portfolio_model.zip")
+    log.info(f"Model saved: {run_dir / 'nepserl_portfolio_model.zip'}")
 
-    # ── Dashboard ───────────────────────────────────────────────────────────
     plot_dashboard(tracker, run_dir, TOTAL_TIMESTEPS, NUM_ENVS)
     log.info("Training dashboard saved")
 
-    # ── Multi-ticker OOS evaluation ─────────────────────────────────────────
-    eval_candidates = [
-        "NABIL", "NICA", "SHIVM", "CHDC", "NLIC",
-        "UPPER", "NRIC", "SBL", "GBIME", "SANIMA",
-        "SCB", "ADBL", "NTC", "BOKL", "HBL",
-        "EBL", "NBL", "KBL", "SBI", "CZBIL",
-    ]
-    eval_tickers = [t for t in eval_candidates if t in tickers][:10]
-    if len(eval_tickers) < 10:
-        remaining = [t for t in tickers if t not in eval_tickers]
-        np.random.seed(42)
-        extra = list(np.random.choice(
-            remaining, min(10 - len(eval_tickers), len(remaining)), replace=False))
-        eval_tickers.extend(extra)
+    # ── Deterministic portfolio evaluation ──────────────────────────────────
+    log.info("Running deterministic portfolio evaluation...")
+    traj = evaluate_portfolio(model, ticker_arrays, valid_start_idx,
+                              dates_array, universe, EPISODE_LENGTH)
+    traj.to_csv(run_dir / "eval_portfolio.csv", index=False)
 
-    log.info(f"OOS evaluation on {len(eval_tickers)} tickers: {eval_tickers}")
-    results = []; all_trajs = {}
-    for tk in eval_tickers:
-        try:
-            m, traj = evaluate_ticker(
-                model, tk, ticker_arrays, valid_start_idx,
-                dates_array, tickers, EPISODE_LENGTH)
-            results.append(m); all_trajs[tk] = traj
-            log.info(f"  {tk:>8s} | Agent {m['agent_return']:+7.2%} | B&H {m['buyhold_return']:+7.2%} | "
-                     f"Excess {m['excess_return']:+7.2%} | Sharpe {m['sharpe_ratio']:+.2f} | "
-                     f"MaxDD {m['max_drawdown']:.2%} | Buy {m['buy_ratio']:.1%}")
-        except Exception as e:
-            log.warning(f"  {tk}: eval failed — {e}")
+    pv = traj["portfolio_value"].values
+    agent_ret = pv[-1] / pv[0] - 1.0
+    pv_rets = np.diff(pv) / (pv[:-1] + 1e-10)
+    sharpe  = np.mean(pv_rets) / (np.std(pv_rets) + 1e-10) * np.sqrt(252)
+    cummax  = np.maximum.accumulate(pv)
+    max_dd  = np.max((cummax - pv) / (cummax + 1e-10))
 
-    results_df = pd.DataFrame(results)
-    results_df.to_csv(run_dir / "oos_evaluation.csv", index=False)
+    # Equal-weight B&H benchmark
+    n = len(traj)
+    bh_pv = np.ones(n)
+    valid_bh = 0
+    for tk in universe:
+        col = f"close_{tk}"
+        if col in traj.columns:
+            cl = traj[col].values
+            if cl[0] > 0 and not np.isnan(cl[0]):
+                bh_pv += (cl / cl[0] - 1.0) / len(universe)
+                valid_bh += 1
+    bh_ret = bh_pv[-1] / bh_pv[0] - 1.0
 
-    # ── OOS summary ─────────────────────────────────────────────────────────
-    if not results_df.empty:
-        n_beat = (results_df["excess_return"] > 0).sum()
-        n_total = len(results_df)
-        log.info("=" * 60)
-        log.info("OOS AGGREGATE")
-        log.info(f"  Beat B&H          : {n_beat}/{n_total} ({n_beat/n_total:.0%})")
-        log.info(f"  Avg excess return  : {results_df['excess_return'].mean():+.2%}")
-        log.info(f"  Median excess      : {results_df['excess_return'].median():+.2%}")
-        log.info(f"  Avg Sharpe         : {results_df['sharpe_ratio'].mean():+.2f}")
-        log.info(f"  Avg max drawdown   : {results_df['max_drawdown'].mean():.2%}")
-        log.info(f"  Avg buy ratio      : {results_df['buy_ratio'].mean():.1%}")
-        if n_beat >= 8:
-            log.info("SYSTEM IS FUNDAMENTALLY ROBUST (>=8/10 tickers beaten)")
-        elif n_beat >= 5:
-            log.info(f"PARTIAL ROBUSTNESS ({n_beat}/10)")
-        else:
-            log.info(f"INSUFFICIENT ROBUSTNESS ({n_beat}/10)")
-        log.info("=" * 60)
+    # Per-asset weight analysis
+    log.info("=" * 70)
+    log.info("PORTFOLIO EVALUATION RESULTS")
+    log.info(f"  Agent Return   : {agent_ret:+.2%}")
+    log.info(f"  EW B&H Return  : {bh_ret:+.2%}")
+    log.info(f"  Excess Return  : {agent_ret - bh_ret:+.2%}")
+    log.info(f"  Sharpe Ratio   : {sharpe:+.2f}")
+    log.info(f"  Max Drawdown   : {max_dd:.2%}")
 
-    # ── Equity curve plots ──────────────────────────────────────────────────
-    if all_trajs:
-        plot_equity_curves(all_trajs, run_dir)
-        log.info("OOS equity curves saved")
+    # Average weight per asset
+    log.info("  Avg Weights:")
+    avg_cash = traj["cash_weight"].mean() if "cash_weight" in traj.columns else 0.0
+    log.info(f"    Cash       : {avg_cash:.1%}")
+    for tk in universe:
+        col = f"w_{tk}"
+        if col in traj.columns:
+            avg_w = traj[col].mean()
+            log.info(f"    {tk:>8s}   : {avg_w:.1%}")
 
-    # ── Final summary CSV ───────────────────────────────────────────────────
+    # Individual asset B&H comparison
+    log.info("  Per-Asset B&H:")
+    per_asset = []
+    for tk in universe:
+        col = f"close_{tk}"
+        if col in traj.columns:
+            cl = traj[col].values
+            if cl[0] > 0 and not np.isnan(cl[0]) and not np.isnan(cl[-1]):
+                bh = cl[-1] / cl[0] - 1.0
+                log.info(f"    {tk:>8s}   : {bh:+.2%}")
+                per_asset.append({"ticker": tk, "bh_return": bh})
+    log.info("=" * 70)
+
+    # ── Plots ───────────────────────────────────────────────────────────────
+    plot_portfolio_equity(traj, universe, run_dir)
+    log.info("Portfolio equity plot saved")
+
+    # ── Summary CSV ─────────────────────────────────────────────────────────
     summary = {
         "metric": [
             "total_episodes", "total_timesteps", "training_fps", "wall_time_min",
             "final_avg_reward_100", "best_avg_reward_100",
             "num_envs", "batch_size", "n_steps", "network",
-            "oos_tickers_evaluated", "oos_tickers_beating_bh",
-            "oos_avg_excess_return", "oos_avg_sharpe", "oos_avg_max_dd",
+            "obs_dim", "act_dim", "n_assets",
+            "agent_return", "ew_bh_return", "excess_return",
+            "sharpe_ratio", "max_drawdown", "avg_cash_weight",
             "device", "gpu",
         ],
         "value": [
@@ -698,20 +735,14 @@ def main():
             f"{fps:,.0f}", f"{elapsed/60:.1f}",
             f"{final_avg:+.4f}", f"{tracker._best_avg:+.4f}",
             NUM_ENVS, 2048, 4096, "[256,256,128]x2",
-            len(results_df) if not results_df.empty else 0,
-            int((results_df["excess_return"] > 0).sum()) if not results_df.empty else 0,
-            f"{results_df['excess_return'].mean():+.4f}" if not results_df.empty else "N/A",
-            f"{results_df['sharpe_ratio'].mean():+.2f}" if not results_df.empty else "N/A",
-            f"{results_df['max_drawdown'].mean():.4f}" if not results_df.empty else "N/A",
+            obs_dim, act_dim, n_assets,
+            f"{agent_ret:+.4f}", f"{bh_ret:+.4f}", f"{agent_ret - bh_ret:+.4f}",
+            f"{sharpe:+.2f}", f"{max_dd:.4f}", f"{avg_cash:.4f}",
             device,
             torch.cuda.get_device_name(0) if torch.cuda.is_available() else "N/A",
         ],
     }
     pd.DataFrame(summary).to_csv(run_dir / "summary_metrics.csv", index=False)
-
-    for tk, traj in all_trajs.items():
-        traj.to_csv(run_dir / f"eval_{tk}.csv", index=False)
-
     log.info(f"All results saved in: {run_dir.resolve()}")
     log.info("DONE")
 

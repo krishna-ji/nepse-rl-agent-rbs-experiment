@@ -1,31 +1,33 @@
 #!/usr/bin/env python3
 """
-NEPSE RL Portfolio Engine v11 — Walk-Forward Risk Parity
+NEPSE RL Portfolio Engine v10 — Conviction Expansion
 ======================================================================
 Single-file PPO engine trading 10 randomly-sampled NEPSE assets per
 episode, with a strict temporal firewall between training and evaluation.
 
-v11 innovations (over v10):
-  1. WALK-FORWARD EXPANDING WINDOW: 7 chronological folds (2019-2025),
-     each fold trains on all prior data and evaluates on the next year.
-  2. TRANSFER LEARNING: Neural network weights carry forward across folds.
-     Fold 1 trains 5M steps; subsequent folds fine-tune 1M steps each.
-  3. RISK PARITY BENCHMARK: Inverse Volatility Weighting replaces naive
-     Equal-Weight (1/N). Agent must beat a volatility-adjusted baseline.
-  4. REALISTIC FRICTION: TAU=0.0045 (0.40% broker + 0.015% SEBON + slippage).
+Key v9 innovations:
+  1. TEMPORAL FIREWALL: Train on [2012, 2024-07-01), eval on [2024-07-01, 2026]
+     -> Zero overlap. No data leakage. No memorization.
+  2. DYNAMIC UNIVERSE SAMPLING: Each reset() picks a random date FIRST,
+     then samples 10 tickers from the pool of stocks alive at that date.
+     C(325,10) x 2854 date combinations -> ~10^18 unique state tensors.
+  3. TICKER-AGNOSTIC: Agent reads pure feature geometry (CLV, Ribbon, CMF...),
+     never learns "NABIL is slot 3". Forced to generalize.
+  4. Alpha Gradient (5x active return), Softmax Temperature (2.0),
+     Deadband Filter (1%), Forward-fill OHLCV.
 
-Retained from v9/v10:
-  - TEMPORAL FIREWALL: split_index separates train/eval with zero overlap
+v9 changes (over v8):
+  - TEMPORAL FIREWALL: SPLIT_DATE separates train/eval with zero overlap
   - DYNAMIC UNIVERSE: Each episode samples 10 random tickers from pool
   - TICKER-AGNOSTIC: Agent reads pure features, never learns ticker identity
-  - Alpha Gradient (30x), Softmax Temperature (2.0), Deadband (1%)
+  - Retains: Alpha Gradient, Softmax Temperature, Deadband, Forward-fill
 
 Architecture:
   - State: (10 assets x 11 features) + (11 current weights) = 121 dims
   - Action: Box(-3, 3, shape=(11,)) -> Softmax(x2.0 temp) -> weights
-  - Reward: port_ret - tau*turnover + 30*(port_ret - rp_ret)
+  - Reward: port_ret - tau*turnover + 30*(port_ret - ew_ret)
 
-Hardware: 16 CPU SubprocVecEnv, RTX 4060, 128 GB RAM
+Hardware: 32 CPU SubprocVecEnv, RTX 4060, 128 GB RAM
 Data: 325 NEPSE tickers, 6833 daily bars (1997-2026)
 """
 
@@ -50,18 +52,16 @@ from typing import Callable
 # CONFIGURATION
 # ============================================================================
 
-NUM_ENVS        = 16          # SubprocVecEnv workers
+NUM_ENVS        = 16          # reduced from 32 for [512,512,256] memory budget
+TOTAL_TIMESTEPS = 15_000_000
 EPISODE_LENGTH  = 252         # 1 trading year
 MIN_ROWS        = 250         # minimum rows to load a ticker
 WARMUP          = 200         # feature warmup rows
 SEED            = 42
 N_ASSETS        = 10          # portfolio size (slots per episode)
 
-# Walk-Forward Expanding Window fold dates
-FOLD_DATES = ["2019-01-01", "2020-01-01", "2021-01-01",
-              "2022-01-01", "2023-01-01", "2024-01-01", "2025-01-01"]
-FOLD_1_TIMESTEPS = 5_000_000    # initial long training (first fold)
-FOLD_N_TIMESTEPS = 1_000_000    # adaptation per subsequent fold
+# Temporal firewall: train BEFORE this date, eval AFTER
+SPLIT_DATE = "2024-07-01"
 
 # Fixed 10-asset evaluation universe (locked during OOS eval)
 EVAL_UNIVERSE = ["NABIL", "NICA", "SHIVM", "CHDC", "NLIC",
@@ -72,10 +72,11 @@ EVAL_UNIVERSE = ["NABIL", "NICA", "SHIVM", "CHDC", "NLIC",
 # ============================================================================
 
 def setup():
+    PROJECT_ROOT = pathlib.Path(__file__).resolve().parents[2]
     RUN_TS  = f"{datetime.datetime.now():%Y%m%d_%H%M%S}"
-    RUN_DIR = pathlib.Path(f"runs/{RUN_TS}")
+    RUN_DIR = PROJECT_ROOT / f"runs/{RUN_TS}"
     RUN_DIR.mkdir(parents=True, exist_ok=True)
-    DATA_DIR = pathlib.Path("data/ohlcv/1D/stocks")
+    DATA_DIR = PROJECT_ROOT / "data/ohlcv/1D/stocks"
     DEVICE   = "cuda" if torch.cuda.is_available() else "cpu"
 
     log = logging.getLogger("nepserl")
@@ -86,10 +87,10 @@ def setup():
     fh = logging.FileHandler(RUN_DIR / "nepserl_portfolio.log", encoding="utf-8")
     fh.setLevel(logging.DEBUG); fh.setFormatter(fmt); log.addHandler(fh)
 
-    log.info("NEPSE RL Portfolio Engine v11 — Walk-Forward Risk Parity")
+    log.info("NEPSE RL Portfolio Engine v10 — Conviction Expansion")
     log.info(f"Run dir    : {RUN_DIR.resolve()}")
     log.info(f"Device     : {DEVICE}")
-    log.info(f"Fold dates : {FOLD_DATES}")
+    log.info(f"Split date : {SPLIT_DATE}")
     if DEVICE == "cuda":
         p = torch.cuda.get_device_properties(0)
         log.info(f"GPU        : {p.name}  ({p.multi_processor_count * 128} CUDA cores, "
@@ -207,10 +208,6 @@ def compute_features(master_df, valid_start_dates, log):
         pieces[(tk,"ribbon_align")] = bull_count / 4.0 * 2.0 - 1.0
         pieces[(tk,"ribbon_disp")] = ((sma10 - sma200) / (sma200 + 1e-10) * 10.0).clip(-3.0, 3.0)
 
-        # 20-day rolling std of log returns (for Risk Parity weighting)
-        log_ret = np.log(c / c.shift(1))
-        pieces[(tk, "rstd20")] = log_ret.rolling(20, min_periods=20).std()
-
     feat_df = pd.DataFrame(pieces)
     feat_df.columns = pd.MultiIndex.from_tuples(feat_df.columns, names=["Ticker","Feature"])
     feat_df = feat_df.sort_index()
@@ -233,7 +230,7 @@ def compute_features(master_df, valid_start_dates, log):
 OBS_FEATURES = ["clv", "lower_wick", "pct_k", "pct_d", "natr", "bb_pctb", "cmf",
                 "d_low", "dd_state", "ribbon_align", "ribbon_disp"]
 N_FEATURES   = len(OBS_FEATURES)      # 11 per asset
-NEEDED_COLS  = OBS_FEATURES + ["close", "high", "low", "atr14", "protected_swing_low", "rstd20"]
+NEEDED_COLS  = OBS_FEATURES + ["close", "high", "low", "atr14", "protected_swing_low"]
 
 def precompile_arrays(feat_df, tickers, valid_start_dates, log):
     dates_array = feat_df.index.values
@@ -265,11 +262,11 @@ def precompile_arrays(feat_df, tickers, valid_start_dates, log):
 # State:  [asset_1_features(11), ..., asset_10_features(11), w_cash, w_1, ..., w_10]
 #         = 10×11 + 11 = 121 dims
 # Action: Box(-3, 3, shape=(11,)) → Softmax → [w_cash, w_1, ..., w_10]
-# Reward: ln(PV_t / PV_{t-1}) - τ × Turnover + α × (port_ret - rp_ret)
+# Reward: ln(PV_t / PV_{t-1}) - τ × Turnover + α × Active_Return
 
 class NepsePortfolioEnv(gym.Env):
-    TAU         = 0.0045   # 0.45% per unit of turnover (NEPSE broker+SEBON+slippage)
-    ALPHA_SCALE = 30.0     # Alpha Gradient: strong conviction signal over RP benchmark
+    TAU         = 0.0015   # 0.15% per unit of turnover (reduced to allow exploration)
+    ALPHA_SCALE = 30.0     # Alpha Gradient: strong conviction signal over EW benchmark
     TEMPERATURE = 2.0      # Softmax temperature: sharper conviction
     DEADBAND    = 0.01     # Ignore weight shifts < 1% (silence exploration noise)
 
@@ -393,20 +390,14 @@ class NepsePortfolioEnv(gym.Env):
         for j in range(self._n_assets):
             port_return += self._weights[j + 1] * returns[j]
 
-        # ── Risk Parity Benchmark (Inverse Volatility Weighting) ──────────
-        vols = np.empty(self._n_assets, dtype=np.float64)
-        for j, tk in enumerate(self._current_universe):
-            v = float(self._ta[tk]["rstd20"][i])
-            vols[j] = v if (not np.isnan(v) and v > 1e-8) else 1e-4
-        inv_vols = 1.0 / vols
-        rp_weights = inv_vols / inv_vols.sum()
-        rp_return = float(np.dot(rp_weights, returns))
-        active_return = port_return - rp_return
+        # ── Equal-Weight Benchmark return (the "1/N" baseline) ─────────────
+        ew_return = float(np.mean(returns))  # equal across all assets
+        active_return = port_return - ew_return
 
         # ── Reward Topology ────────────────────────────────────────────────
         #  1) Absolute return (survive the market)
         #  2) Turnover friction (don't churn)
-        #  3) Alpha Gradient: 30× bonus for beating Risk Parity benchmark
+        #  3) Alpha Gradient: 5× bonus for beating EW benchmark
         reward = port_return - friction + self.ALPHA_SCALE * active_return
 
         # ── Update portfolio value (actual PnL, no alpha bonus) ────────────
@@ -554,36 +545,6 @@ def evaluate_portfolio(model, ticker_arrays, valid_start_idx, dates_array,
     return pd.DataFrame(records)
 
 # ============================================================================
-# RISK PARITY BENCHMARK
-# ============================================================================
-
-def compute_risk_parity_bh(traj, eval_universe, ticker_arrays, dates_array,
-                           split_index):
-    """Compute Risk Parity (inverse volatility) benchmark equity curve."""
-    n = len(traj)
-    rp_pv = np.ones(n)
-    for t in range(1, n):
-        day_idx = split_index + t
-        if day_idx >= len(dates_array):
-            break
-        # Inverse-vol weights from previous day's 20-day return std
-        vols = np.empty(len(eval_universe), dtype=np.float64)
-        for j, tk in enumerate(eval_universe):
-            v = float(ticker_arrays[tk]["rstd20"][day_idx - 1])
-            vols[j] = v if (not np.isnan(v) and v > 1e-8) else 1e-4
-        inv_vols = 1.0 / vols
-        rp_w = inv_vols / inv_vols.sum()
-        # Daily return weighted by inv-vol
-        daily_ret = 0.0
-        for j, tk in enumerate(eval_universe):
-            c_now = float(ticker_arrays[tk]["close"][day_idx])
-            c_prev = float(ticker_arrays[tk]["close"][day_idx - 1])
-            if not np.isnan(c_now) and not np.isnan(c_prev) and c_prev > 1e-6:
-                daily_ret += rp_w[j] * (c_now / c_prev - 1.0)
-        rp_pv[t] = rp_pv[t - 1] * (1.0 + daily_ret)
-    return rp_pv
-
-# ============================================================================
 # PLOTS
 # ============================================================================
 
@@ -621,25 +582,21 @@ def plot_dashboard(tracker, run_dir, total_ts, num_envs, split_date):
     ax.set_xlabel("Timesteps"); ax.set_ylabel("Explained Var")
     ax.set_title("Value Function Quality"); ax.grid(alpha=0.3)
 
-    plt.suptitle(f"NEPSE Portfolio v11 — {total_ts/1e6:.0f}M steps, "
-                 f"{num_envs} envs, {split_date}", fontsize=14)
+    plt.suptitle(f"NEPSE Portfolio v10 — {total_ts/1e6:.0f}M steps, "
+                 f"{num_envs} envs, split={split_date}", fontsize=14)
     plt.tight_layout()
     plt.savefig(run_dir / "training_dashboard.png", dpi=150, bbox_inches="tight")
     plt.close()
 
-def plot_portfolio_equity(traj, universe, run_dir, split_date,
-                          rp_pv=None, fold_num=None):
+def plot_portfolio_equity(traj, universe, run_dir, split_date):
     fig, axes = plt.subplots(2, 1, figsize=(16, 10))
 
-    # Top: Portfolio equity vs Risk Parity & EW benchmarks
+    # Top: Portfolio equity vs equal-weight B&H
     ax = axes[0]
     pv = traj["portfolio_value"].values
     ax.plot(pv, label=f"Agent ({pv[-1]-1:+.1%})", color="dodgerblue", lw=2)
 
-    if rp_pv is not None:
-        ax.plot(rp_pv, label=f"RP B&H ({rp_pv[-1]-1:+.1%})", color="darkorange", lw=2)
-
-    # EW B&H for reference
+    # Compute equal-weight B&H
     n = len(traj)
     bh_pv = np.ones(n)
     for tk in universe:
@@ -648,11 +605,11 @@ def plot_portfolio_equity(traj, universe, run_dir, split_date,
             cl = traj[col].values
             if cl[0] > 0 and not np.isnan(cl[0]):
                 bh_pv += (cl / cl[0] - 1.0) / len(universe)
-    ax.plot(bh_pv, label=f"EW B&H ({bh_pv[-1]-1:+.1%})", color="gray", lw=1, ls="--", alpha=0.5)
+    ax.plot(bh_pv, label=f"EW B&H ({bh_pv[-1]-1:+.1%})", color="gray", lw=1.5, alpha=0.7)
     ax.axhline(1.0, color="black", ls="--", alpha=0.3)
     ax.set_ylabel("Portfolio Value")
-    fold_str = f" Fold {fold_num}" if fold_num else ""
-    ax.set_title(f"OOS{fold_str} (post {split_date}): Agent vs Risk Parity B&H")
+    ax.set_title(f"OOS Portfolio Equity (post {split_date}): "
+                 f"Agent vs Equal-Weight B&H")
     ax.legend(); ax.grid(alpha=0.3)
 
     # Bottom: Weight allocation over time (stacked area)
@@ -670,12 +627,11 @@ def plot_portfolio_equity(traj, universe, run_dir, split_date,
     ax.set_ylim(0, 1.05)
 
     plt.tight_layout()
-    suffix = f"_fold{fold_num}" if fold_num else ""
-    plt.savefig(run_dir / f"portfolio_equity{suffix}.png", dpi=150, bbox_inches="tight")
+    plt.savefig(run_dir / "portfolio_equity.png", dpi=150, bbox_inches="tight")
     plt.close()
 
 # ============================================================================
-# MAIN — Walk-Forward Expanding Window with Transfer Learning
+# MAIN
 # ============================================================================
 
 def main():
@@ -687,40 +643,49 @@ def main():
     ticker_arrays, valid_start_idx, dates_array, n_dates = precompile_arrays(
         feat_df, tickers, valid_start_dates, log)
 
-    # ── Compute fold indices from FOLD_DATES ────────────────────────────────
-    fold_indices = []
-    for d in FOLD_DATES:
-        dt = np.datetime64(d)
-        idx = int(np.searchsorted(dates_array, dt))
-        fold_indices.append(idx)
-    fold_indices.append(n_dates - 1)  # end-of-data sentinel
-    n_folds = len(FOLD_DATES)
+    # ── Compute SPLIT_INDEX from SPLIT_DATE ─────────────────────────────────
+    split_dt = np.datetime64(SPLIT_DATE)
+    split_index = int(np.searchsorted(dates_array, split_dt))
+    split_actual = pd.Timestamp(dates_array[split_index]).strftime("%Y-%m-%d")
+    oos_days = n_dates - split_index
+    log.info(f"SPLIT_INDEX = {split_index} ({split_actual}), "
+             f"OOS days = {oos_days}")
 
-    log.info(f"Walk-Forward: {n_folds} folds")
-    for fi in range(n_folds):
-        s_date = pd.Timestamp(dates_array[fold_indices[fi]]).strftime("%Y-%m-%d")
-        e_date = pd.Timestamp(dates_array[fold_indices[fi + 1]]).strftime("%Y-%m-%d")
-        e_days = fold_indices[fi + 1] - fold_indices[fi]
-        log.info(f"  Fold {fi+1}: train < {s_date}, "
-                 f"eval [{s_date} → {e_date}] = {e_days} days")
+    # ── Training pool statistics ────────────────────────────────────────────
+    counts = np.zeros(n_dates, dtype=np.int32)
+    for si in valid_start_idx.values():
+        if si < n_dates:
+            counts[si:] += 1
+    valid_idxs = np.where(counts >= N_ASSETS)[0]
+    min_train = int(valid_idxs[0]) if len(valid_idxs) > 0 else 0
+    max_train = split_index - EPISODE_LENGTH
+    train_range_days = max_train - min_train
+    min_date = pd.Timestamp(dates_array[min_train]).strftime("%Y-%m-%d")
+    max_date = pd.Timestamp(dates_array[max_train]).strftime("%Y-%m-%d")
+    log.info(f"Training zone: [{min_date}..{max_date}] "
+             f"= {train_range_days:,} sampable start dates")
+    log.info(f"  Pool at train start ({min_date}): "
+             f"{counts[min_train]} tickers")
+    log.info(f"  Pool at train end   ({max_date}): "
+             f"{counts[max_train]} tickers")
+    log.info(f"  Eval universe: {EVAL_UNIVERSE}")
 
-    # ── Verify all eval tickers valid before earliest fold ──────────────────
-    earliest_split = fold_indices[0]
+    # Verify all eval tickers valid before split
     for tk in EVAL_UNIVERSE:
         si = valid_start_idx.get(tk, 99999)
-        if si >= earliest_split:
-            log.warning(f"  WARNING {tk} valid_start={si} >= "
-                        f"earliest split={earliest_split}!")
+        if si >= split_index:
+            log.warning(f"  WARNING {tk} valid_start={si} >= split={split_index}!")
         else:
             log.info(f"  OK {tk} valid_start={si} "
                      f"({pd.Timestamp(dates_array[si]).strftime('%Y-%m-%d')})")
 
     obs_dim = N_ASSETS * N_FEATURES + (N_ASSETS + 1)
     act_dim = N_ASSETS + 1
-    log.info(f"Obs dim: {obs_dim}, Act dim: {act_dim}")
+    log.info(f"Obs dim: {obs_dim} = {N_ASSETS}x{N_FEATURES} + {N_ASSETS+1}")
+    log.info(f"Act dim: {act_dim} = {N_ASSETS} assets + cash")
 
-    # ── Env factory (parameterized by split_index) ──────────────────────────
-    def make_env(rank, split_index, seed=SEED):
+    # ── SubprocVecEnv factory (training mode) ───────────────────────────────
+    def make_env(rank, seed=SEED):
         def _init():
             return Monitor(NepsePortfolioEnv(
                 ticker_arrays, valid_start_idx, dates_array,
@@ -732,14 +697,12 @@ def main():
                 seed=seed + rank))
         return _init
 
-    # ── Initialize PPO model on first fold's env ────────────────────────────
-    first_split = fold_indices[0]
-    log.info(f"Spawning {NUM_ENVS} SubprocVecEnv workers "
-             f"(fold 1, split={first_split})...")
+    log.info(f"Spawning {NUM_ENVS} SubprocVecEnv workers (training mode)...")
     vec_env = SubprocVecEnv(
-        [make_env(i, first_split) for i in range(NUM_ENVS)],
-        start_method="spawn")
+        [make_env(i) for i in range(NUM_ENVS)], start_method="spawn")
+    log.info(f"SubprocVecEnv ready — {NUM_ENVS} workers active")
 
+    # ── PPO Model ───────────────────────────────────────────────────────────
     model = PPO(
         "MlpPolicy", vec_env,
         learning_rate=linear_schedule(2e-4),
@@ -761,187 +724,127 @@ def main():
         ),
     )
     n_params = sum(p.numel() for p in model.policy.parameters())
-    log.info(f"PPO on {model.device} — {n_params:,} params")
+    buf = 4096 * NUM_ENVS
+    log.info(f"PPO on {model.device} — {n_params:,} params, "
+             f"buffer {buf:,}/rollout")
 
-    # ── Walk-Forward Training + Evaluation Loop ─────────────────────────────
+    # ── Train ───────────────────────────────────────────────────────────────
     tracker = PortfolioTracker(run_dir)
-    fold_results = []
-    t0_total = time.time()
-
-    for fold_i in range(n_folds):
-        split_index = fold_indices[fold_i]
-        eval_end_idx = fold_indices[fold_i + 1]
-        eval_days = eval_end_idx - split_index
-        split_actual = pd.Timestamp(
-            dates_array[split_index]).strftime("%Y-%m-%d")
-        eval_end_actual = pd.Timestamp(
-            dates_array[eval_end_idx]).strftime("%Y-%m-%d")
-
-        timesteps = FOLD_1_TIMESTEPS if fold_i == 0 else FOLD_N_TIMESTEPS
-
-        log.info("=" * 70)
-        log.info(f"FOLD {fold_i+1}/{n_folds}: train < {split_actual}, "
-                 f"eval [{split_actual} → {eval_end_actual}], "
-                 f"{timesteps:,} steps")
-        log.info("=" * 70)
-
-        # Recreate envs with updated split_index (except fold 1)
-        if fold_i > 0:
-            vec_env.close()
-            log.info(f"Spawning {NUM_ENVS} workers "
-                     f"(fold {fold_i+1}, split={split_index})...")
-            vec_env = SubprocVecEnv(
-                [make_env(i, split_index) for i in range(NUM_ENVS)],
-                start_method="spawn")
-            model.set_env(vec_env)
-
-        # ── Train (transfer learning: weights carry forward) ────────────
-        t0 = time.time()
-        model.learn(total_timesteps=timesteps,
-                    callback=[tracker], progress_bar=True,
-                    reset_num_timesteps=(fold_i == 0))
-        elapsed = time.time() - t0
-        fps = timesteps / elapsed if elapsed > 0 else 0
-        log.info(f"Fold {fold_i+1} training: {elapsed/60:.1f} min, "
-                 f"{fps:,.0f} FPS")
-
-        if tracker.ep_rewards:
-            recent = tracker.ep_rewards[-100:]
-            log.info(f"  Reward (last 100 eps): "
-                     f"{np.mean(recent):+.4f}±{np.std(recent):.3f}")
-
-        model.save(run_dir / f"model_fold_{fold_i+1}.zip")
-
-        # ── OOS Evaluation on this fold's window ────────────────────────
-        eval_length = min(eval_days - 1, n_dates - split_index - 1)
-        log.info(f"Evaluating fold {fold_i+1}: {EVAL_UNIVERSE}, "
-                 f"{eval_length} days post {split_actual}")
-
-        traj = evaluate_portfolio(
-            model, ticker_arrays, valid_start_idx, dates_array,
-            all_tickers=tickers, split_index=split_index,
-            eval_universe=EVAL_UNIVERSE,
-            n_assets=N_ASSETS, episode_length=eval_length)
-        traj.to_csv(run_dir / f"eval_fold_{fold_i+1}.csv", index=False)
-
-        # Agent metrics
-        pv = traj["portfolio_value"].values
-        agent_ret = pv[-1] / pv[0] - 1.0
-        pv_rets = np.diff(pv) / (pv[:-1] + 1e-10)
-        sharpe = (np.mean(pv_rets) / (np.std(pv_rets) + 1e-10)
-                  * np.sqrt(252))
-        cummax = np.maximum.accumulate(pv)
-        max_dd = np.max((cummax - pv) / (cummax + 1e-10))
-
-        # Risk Parity benchmark
-        rp_pv = compute_risk_parity_bh(
-            traj, EVAL_UNIVERSE, ticker_arrays, dates_array, split_index)
-        rp_ret = rp_pv[-1] / rp_pv[0] - 1.0
-
-        # EW B&H for reference
-        n_traj = len(traj)
-        ew_pv = np.ones(n_traj)
-        for tk in EVAL_UNIVERSE:
-            col = f"close_{tk}"
-            if col in traj.columns:
-                cl = traj[col].values
-                if cl[0] > 0 and not np.isnan(cl[0]):
-                    ew_pv += (cl / cl[0] - 1.0) / len(EVAL_UNIVERSE)
-        ew_ret = ew_pv[-1] / ew_pv[0] - 1.0
-
-        fold_results.append({
-            "fold": fold_i + 1,
-            "split_date": split_actual,
-            "eval_end": eval_end_actual,
-            "eval_days": len(traj),
-            "agent_return": agent_ret,
-            "rp_bh_return": rp_ret,
-            "ew_bh_return": ew_ret,
-            "excess_vs_rp": agent_ret - rp_ret,
-            "excess_vs_ew": agent_ret - ew_ret,
-            "sharpe": sharpe,
-            "max_dd": max_dd,
-        })
-
-        log.info(f"  Agent Return     : {agent_ret:+.2%}")
-        log.info(f"  RP B&H Return    : {rp_ret:+.2%}")
-        log.info(f"  EW B&H Return    : {ew_ret:+.2%}")
-        log.info(f"  Excess (vs RP)   : {agent_ret - rp_ret:+.2%}")
-        log.info(f"  Sharpe           : {sharpe:+.2f}")
-        log.info(f"  Max Drawdown     : {max_dd:.2%}")
-
-        # Per-fold equity plot
-        plot_portfolio_equity(traj, EVAL_UNIVERSE, run_dir, split_actual,
-                              rp_pv=rp_pv, fold_num=fold_i + 1)
-
+    log.info(f"Starting training: {TOTAL_TIMESTEPS:,} timesteps...")
+    t0 = time.time()
+    model.learn(total_timesteps=TOTAL_TIMESTEPS,
+                callback=[tracker], progress_bar=True)
+    elapsed = time.time() - t0
     vec_env.close()
     tracker._export()
-    total_elapsed = time.time() - t0_total
 
-    # ── Export fold matrix ──────────────────────────────────────────────────
-    fold_df = pd.DataFrame(fold_results)
-    fold_df.to_csv(run_dir / "fold_matrix.csv", index=False)
+    fps = TOTAL_TIMESTEPS / elapsed
+    final_avg = (np.mean(tracker.ep_rewards[-100:])
+                 if len(tracker.ep_rewards) >= 100 else 0.0)
+    log.info(f"Training complete — {elapsed/60:.1f} min, {fps:,.0f} FPS")
+    log.info(f"  Episodes : {len(tracker.ep_rewards):,}")
+    log.info(f"  Final R  : {final_avg:+.4f}")
+    log.info(f"  Best R   : {tracker._best_avg:+.4f}")
 
-    log.info("=" * 70)
-    log.info("WALK-FORWARD FOLD MATRIX")
-    log.info("=" * 70)
-    log.info(f"{'Fold':>4} | {'Split Date':>11} | {'Eval End':>11} | "
-             f"{'Agent':>8} | {'RP B&H':>8} | {'Excess':>8} | "
-             f"{'Sharpe':>7} | {'MaxDD':>7}")
-    log.info("-" * 85)
-    for r in fold_results:
-        log.info(
-            f"{r['fold']:4d} | {r['split_date']:>11s} | "
-            f"{r['eval_end']:>11s} | "
-            f"{r['agent_return']:+7.2%} | {r['rp_bh_return']:+7.2%} | "
-            f"{r['excess_vs_rp']:+7.2%} | {r['sharpe']:+6.2f} | "
-            f"{r['max_dd']:6.2%}")
-    log.info("-" * 85)
+    model.save(run_dir / "nepserl_portfolio_model.zip")
+    log.info(f"Model saved: {run_dir / 'nepserl_portfolio_model.zip'}")
 
-    # Aggregates
-    avg_excess = np.mean([r["excess_vs_rp"] for r in fold_results])
-    avg_sharpe = np.mean([r["sharpe"] for r in fold_results])
-    wins = sum(1 for r in fold_results if r["excess_vs_rp"] > 0)
-    log.info(f"Avg Excess vs RP: {avg_excess:+.2%} | "
-             f"Avg Sharpe: {avg_sharpe:+.2f} | "
-             f"Win Rate: {wins}/{n_folds}")
-    log.info(f"Total wall time: {total_elapsed/60:.1f} min")
-
-    # ── Training dashboard ──────────────────────────────────────────────────
-    total_ts = FOLD_1_TIMESTEPS + FOLD_N_TIMESTEPS * (n_folds - 1)
-    plot_dashboard(tracker, run_dir, total_ts, NUM_ENVS,
-                   f"{n_folds} folds")
+    plot_dashboard(tracker, run_dir, TOTAL_TIMESTEPS, NUM_ENVS, SPLIT_DATE)
     log.info("Training dashboard saved")
+
+    # ── OOS Evaluation (post-split, locked universe) ────────────────────────
+    log.info("=" * 70)
+    log.info("OUT-OF-SAMPLE EVALUATION")
+    log.info(f"  Universe : {EVAL_UNIVERSE}")
+    log.info(f"  Start    : {split_actual} (idx {split_index})")
+    log.info(f"  Duration : {min(EPISODE_LENGTH, oos_days - 1)} days")
+    log.info("=" * 70)
+
+    traj = evaluate_portfolio(
+        model, ticker_arrays, valid_start_idx, dates_array,
+        all_tickers=tickers, split_index=split_index,
+        eval_universe=EVAL_UNIVERSE,
+        n_assets=N_ASSETS, episode_length=min(EPISODE_LENGTH, oos_days - 1))
+    traj.to_csv(run_dir / "eval_portfolio.csv", index=False)
+
+    pv = traj["portfolio_value"].values
+    agent_ret = pv[-1] / pv[0] - 1.0
+    pv_rets = np.diff(pv) / (pv[:-1] + 1e-10)
+    sharpe  = (np.mean(pv_rets) / (np.std(pv_rets) + 1e-10)
+               * np.sqrt(252))
+    cummax  = np.maximum.accumulate(pv)
+    max_dd  = np.max((cummax - pv) / (cummax + 1e-10))
+
+    # Equal-weight B&H benchmark
+    n = len(traj)
+    bh_pv = np.ones(n)
+    for tk in EVAL_UNIVERSE:
+        col = f"close_{tk}"
+        if col in traj.columns:
+            cl = traj[col].values
+            if cl[0] > 0 and not np.isnan(cl[0]):
+                bh_pv += (cl / cl[0] - 1.0) / len(EVAL_UNIVERSE)
+    bh_ret = bh_pv[-1] / bh_pv[0] - 1.0
+
+    log.info(f"  Agent Return   : {agent_ret:+.2%}")
+    log.info(f"  EW B&H Return  : {bh_ret:+.2%}")
+    log.info(f"  Excess Return  : {agent_ret - bh_ret:+.2%}")
+    log.info(f"  Sharpe Ratio   : {sharpe:+.2f}")
+    log.info(f"  Max Drawdown   : {max_dd:.2%}")
+
+    log.info("  Avg Weights:")
+    avg_cash = (traj["cash_weight"].mean()
+                if "cash_weight" in traj.columns else 0.0)
+    log.info(f"    Cash       : {avg_cash:.1%}")
+    for tk in EVAL_UNIVERSE:
+        col = f"w_{tk}"
+        if col in traj.columns:
+            log.info(f"    {tk:>8s}   : {traj[col].mean():.1%}")
+
+    log.info("  Per-Asset B&H:")
+    for tk in EVAL_UNIVERSE:
+        col = f"close_{tk}"
+        if col in traj.columns:
+            cl = traj[col].values
+            if cl[0] > 0 and not np.isnan(cl[0]) and not np.isnan(cl[-1]):
+                bh = cl[-1] / cl[0] - 1.0
+                log.info(f"    {tk:>8s}   : {bh:+.2%}")
+    log.info("=" * 70)
+
+    plot_portfolio_equity(traj, EVAL_UNIVERSE, run_dir, SPLIT_DATE)
+    log.info("Portfolio equity plot saved")
 
     # ── Summary CSV ─────────────────────────────────────────────────────────
     summary = {
         "metric": [
-            "version", "n_folds", "fold_dates",
-            "fold_1_timesteps", "fold_n_timesteps", "total_timesteps",
-            "eval_universe", "n_assets", "obs_dim", "act_dim",
-            "network", "tau", "alpha_scale",
-            "avg_agent_return", "avg_rp_bh_return", "avg_excess_vs_rp",
-            "avg_ew_bh_return", "avg_excess_vs_ew",
-            "avg_sharpe", "win_rate_vs_rp",
-            "total_episodes", "wall_time_min",
+            "version", "split_date", "split_index",
+            "train_start", "train_end", "train_range_days",
+            "eval_start", "eval_days", "eval_universe",
+            "total_episodes", "total_timesteps", "training_fps",
+            "wall_time_min",
+            "final_avg_reward_100", "best_avg_reward_100",
+            "num_envs", "batch_size", "n_steps", "network",
+            "obs_dim", "act_dim", "n_assets",
+            "agent_return", "ew_bh_return", "excess_return",
+            "sharpe_ratio", "max_drawdown", "avg_cash_weight",
             "device", "gpu",
         ],
         "value": [
-            "v11_walkforward_riskparity",
-            n_folds, ",".join(FOLD_DATES),
-            FOLD_1_TIMESTEPS, FOLD_N_TIMESTEPS, total_ts,
-            ",".join(EVAL_UNIVERSE), N_ASSETS, obs_dim, act_dim,
-            "[512,512,256]x2", NepsePortfolioEnv.TAU,
-            NepsePortfolioEnv.ALPHA_SCALE,
-            f"{np.mean([r['agent_return'] for r in fold_results]):+.4f}",
-            f"{np.mean([r['rp_bh_return'] for r in fold_results]):+.4f}",
-            f"{avg_excess:+.4f}",
-            f"{np.mean([r['ew_bh_return'] for r in fold_results]):+.4f}",
-            f"{np.mean([r['excess_vs_ew'] for r in fold_results]):+.4f}",
-            f"{avg_sharpe:+.2f}",
-            f"{wins}/{n_folds}",
+            "v10_conviction_expansion",
+            SPLIT_DATE, split_index,
+            min_date, max_date, train_range_days,
+            split_actual,
+            min(EPISODE_LENGTH, oos_days - 1),
+            ",".join(EVAL_UNIVERSE),
             len(tracker.ep_rewards),
-            f"{total_elapsed/60:.1f}",
+            tracker.ep_ts[-1] if tracker.ep_ts else 0,
+            f"{fps:,.0f}", f"{elapsed/60:.1f}",
+            f"{final_avg:+.4f}", f"{tracker._best_avg:+.4f}",
+            NUM_ENVS, 4096, 4096, "[512,512,256]x2",
+            obs_dim, act_dim, N_ASSETS,
+            f"{agent_ret:+.4f}", f"{bh_ret:+.4f}",
+            f"{agent_ret - bh_ret:+.4f}",
+            f"{sharpe:+.2f}", f"{max_dd:.4f}", f"{avg_cash:.4f}",
             device,
             (torch.cuda.get_device_name(0)
              if torch.cuda.is_available() else "N/A"),

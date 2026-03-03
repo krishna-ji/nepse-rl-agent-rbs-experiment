@@ -26,8 +26,9 @@ from stable_baselines3.common.vec_env import DummyVecEnv
 
 def setup_logging_and_directories():
     """Setup timestamped run directory and logging"""
+    PROJECT_ROOT = pathlib.Path(__file__).resolve().parents[2]
     RUN_TS = f"{datetime.datetime.now():%Y%m%d_%H%M%S}"
-    RUN_DIR = pathlib.Path(f"runs/{RUN_TS}")
+    RUN_DIR = PROJECT_ROOT / f"runs/{RUN_TS}"
     RUN_DIR.mkdir(parents=True, exist_ok=True)
     
     # Logger setup
@@ -50,7 +51,7 @@ def setup_logging_and_directories():
     fh.setFormatter(fmt)
     log.addHandler(fh)
     
-    DATA_DIR = pathlib.Path("data/ohlcv/1D/stocks")
+    DATA_DIR = PROJECT_ROOT / "data/ohlcv/1D/stocks"
     
     # Detect CUDA
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"

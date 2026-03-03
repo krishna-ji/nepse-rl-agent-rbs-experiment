@@ -57,10 +57,11 @@ SEED            = 42
 
 def setup():
     """Setup run directory, logger, device."""
+    PROJECT_ROOT = pathlib.Path(__file__).resolve().parents[2]
     RUN_TS  = f"{datetime.datetime.now():%Y%m%d_%H%M%S}"
-    RUN_DIR = pathlib.Path(f"runs/{RUN_TS}")
+    RUN_DIR = PROJECT_ROOT / f"runs/{RUN_TS}"
     RUN_DIR.mkdir(parents=True, exist_ok=True)
-    DATA_DIR = pathlib.Path("data/ohlcv/1D/stocks")
+    DATA_DIR = PROJECT_ROOT / "data/ohlcv/1D/stocks"
     DEVICE   = "cuda" if torch.cuda.is_available() else "cpu"
 
     log = logging.getLogger("nepserl")

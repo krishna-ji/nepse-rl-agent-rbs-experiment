@@ -1,32 +1,29 @@
 #!/usr/bin/env python3
 """
-NEPSE RL Portfolio Engine v12 — Action Lock + Macro Veto + Relative Momentum
+NEPSE RL Portfolio Engine v11 — Walk-Forward Risk Parity
 ======================================================================
 Single-file PPO engine trading 10 randomly-sampled NEPSE assets per
 episode, with a strict temporal firewall between training and evaluation.
 
-v12 innovations (over v11):
-  1. T+3 ACTION LOCK: Once capital is allocated to an asset, the weight
-     is locked for LOCK_DAYS=3 trading days. Agent cannot sell/reduce.
-     Kills high-frequency whipsawing; forces swing-trade conviction.
-  2. MACRO VETO: Extra action dim (slot 12) acts as binary regime gate.
-     If veto fires (action[11] < 0), entire portfolio forced to 100% Cash.
-     Agent learns to sit out bear/choppy markets entirely.
-  3. RELATIVE MOMENTUM REWARD: Agent is rewarded purely on its distance
-     from the Risk Parity benchmark. If RP is down -2% and agent is
-     down -0.5%, the reward is highly positive. No absolute return in reward.
+v11 innovations (over v10):
+  1. WALK-FORWARD EXPANDING WINDOW: 7 chronological folds (2019-2025),
+     each fold trains on all prior data and evaluates on the next year.
+  2. TRANSFER LEARNING: Neural network weights carry forward across folds.
+     Fold 1 trains 5M steps; subsequent folds fine-tune 1M steps each.
+  3. RISK PARITY BENCHMARK: Inverse Volatility Weighting replaces naive
+     Equal-Weight (1/N). Agent must beat a volatility-adjusted baseline.
+  4. REALISTIC FRICTION: TAU=0.0045 (0.40% broker + 0.015% SEBON + slippage).
 
-Retained from v11:
-  - WALK-FORWARD EXPANDING WINDOW: 7 chronological folds (2019-2025)
-  - TRANSFER LEARNING: Neural network weights carry forward across folds
-  - RISK PARITY BENCHMARK: Inverse Volatility Weighting
-  - REALISTIC FRICTION: TAU=0.0045
-  - TEMPORAL FIREWALL, DYNAMIC UNIVERSE, TICKER-AGNOSTIC
+Retained from v9/v10:
+  - TEMPORAL FIREWALL: split_index separates train/eval with zero overlap
+  - DYNAMIC UNIVERSE: Each episode samples 10 random tickers from pool
+  - TICKER-AGNOSTIC: Agent reads pure features, never learns ticker identity
+  - Alpha Gradient (30x), Softmax Temperature (2.0), Deadband (1%)
 
 Architecture:
-  - State: (10×11 features) + (11 weights) + (11 lock timers) = 132 dims
-  - Action: Box(-3, 3, shape=(12,)) → [0:11] Softmax → weights, [11] macro veto
-  - Reward: ALPHA_SCALE × (port_ret - rp_ret) - friction
+  - State: (10 assets x 11 features) + (11 current weights) = 121 dims
+  - Action: Box(-3, 3, shape=(11,)) -> Softmax(x2.0 temp) -> weights
+  - Reward: port_ret - tau*turnover + 30*(port_ret - rp_ret)
 
 Hardware: 16 CPU SubprocVecEnv, RTX 4060, 128 GB RAM
 Data: 325 NEPSE tickers, 6833 daily bars (1997-2026)
@@ -89,7 +86,7 @@ def setup():
     fh = logging.FileHandler(RUN_DIR / "nepserl_portfolio.log", encoding="utf-8")
     fh.setLevel(logging.DEBUG); fh.setFormatter(fmt); log.addHandler(fh)
 
-    log.info("NEPSE RL Portfolio Engine v12 — Action Lock + Macro Veto + Relative Momentum")
+    log.info("NEPSE RL Portfolio Engine v11 — Walk-Forward Risk Parity")
     log.info(f"Run dir    : {RUN_DIR.resolve()}")
     log.info(f"Device     : {DEVICE}")
     log.info(f"Fold dates : {FOLD_DATES}")
@@ -262,20 +259,19 @@ def precompile_arrays(feat_df, tickers, valid_start_dates, log):
     return ticker_arrays, valid_start_idx, dates_array, n_dates
 
 # ============================================================================
-# PORTFOLIO ENVIRONMENT — T+3 Lock + Macro Veto + Relative Momentum
+# PORTFOLIO ENVIRONMENT — Dynamic Universe + Temporal Firewall
 # ============================================================================
 #
-# State:  [asset_1_features(11)×10, w_cash, w_1..w_10, lock_cash, lock_1..lock_10]
-#         = 110 + 11 + 11 = 132 dims
-# Action: Box(-3, 3, shape=(12,)) → [0:11] Softmax → weights, [11] = macro veto
-# Reward: ALPHA × (port_ret - rp_ret) - friction   (pure relative momentum)
+# State:  [asset_1_features(11), ..., asset_10_features(11), w_cash, w_1, ..., w_10]
+#         = 10×11 + 11 = 121 dims
+# Action: Box(-3, 3, shape=(11,)) → Softmax → [w_cash, w_1, ..., w_10]
+# Reward: ln(PV_t / PV_{t-1}) - τ × Turnover + α × (port_ret - rp_ret)
 
 class NepsePortfolioEnv(gym.Env):
     TAU         = 0.0045   # 0.45% per unit of turnover (NEPSE broker+SEBON+slippage)
     ALPHA_SCALE = 30.0     # Alpha Gradient: strong conviction signal over RP benchmark
     TEMPERATURE = 2.0      # Softmax temperature: sharper conviction
     DEADBAND    = 0.01     # Ignore weight shifts < 1% (silence exploration noise)
-    LOCK_DAYS   = 3        # Minimum holding period (T+3 lock)
 
     def __init__(self, ticker_arrays, valid_start_idx, dates_array,
                  all_tickers, n_assets=10, episode_length=252,
@@ -311,18 +307,14 @@ class NepsePortfolioEnv(gym.Env):
         else:
             self._min_train_start = 0
 
-        # obs = features(110) + weights(11) + lock_timers(11) = 132
-        obs_dim = n_assets * N_FEATURES + (n_assets + 1) + (n_assets + 1)
+        obs_dim = n_assets * N_FEATURES + (n_assets + 1)  # 10×11 + 11 = 121
         self.observation_space = spaces.Box(-5.0, 5.0, shape=(obs_dim,), dtype=np.float32)
-        # action = portfolio_logits(11) + macro_veto(1) = 12
-        self.action_space = spaces.Box(-3.0, 3.0, shape=(n_assets + 2,), dtype=np.float32)
+        self.action_space = spaces.Box(-3.0, 3.0, shape=(n_assets + 1,), dtype=np.float32)
 
         self._rng = np.random.default_rng(seed)
         self._current_universe = []
         self._weights = np.zeros(n_assets + 1, dtype=np.float32)
-        self._lock_timer = np.zeros(n_assets + 1, dtype=np.int32)  # T+3 countdown
         self._si = 0; self._t = 0; self._pv = 1.0
-        self._macro_veto_active = False
 
     def _softmax(self, x):
         e = np.exp(x - np.max(x))
@@ -364,8 +356,6 @@ class NepsePortfolioEnv(gym.Env):
         self._t = 0; self._pv = 1.0
         self._weights = np.zeros(self._n_assets + 1, dtype=np.float32)
         self._weights[0] = 1.0  # start 100% cash
-        self._lock_timer = np.zeros(self._n_assets + 1, dtype=np.int32)
-        self._macro_veto_active = False
         return self._obs(), self._info()
 
     def step(self, action):
@@ -373,42 +363,15 @@ class NepsePortfolioEnv(gym.Env):
         if i >= self._n - 1:
             return self._obs(), 0.0, True, True, self._info()
 
-        # ── Decrement lock timers ──────────────────────────────────────────
-        self._lock_timer = np.maximum(self._lock_timer - 1, 0)
-
-        # ── Macro Veto: action[11] < 0 → force 100% Cash ──────────────────
-        veto_signal = float(action[self._n_assets + 1])  # slot 12 (idx 11)
-        self._macro_veto_active = (veto_signal < 0.0)
-
-        if self._macro_veto_active:
-            # Force liquidation to 100% cash
-            target_weights = np.zeros(self._n_assets + 1, dtype=np.float32)
-            target_weights[0] = 1.0
-        else:
-            # ── Softmax Temperature on portfolio logits [0:11] ─────────────
-            portfolio_logits = action[:self._n_assets + 1]
-            sharpened = portfolio_logits.astype(np.float64) * self.TEMPERATURE
-            target_weights = self._softmax(sharpened).astype(np.float32)
-
-        # ── T+3 Action Lock: prevent reducing locked positions ─────────────
-        for j in range(self._n_assets + 1):
-            if self._lock_timer[j] > 0:
-                # Position is locked — clamp target to at least current weight
-                if target_weights[j] < self._weights[j]:
-                    target_weights[j] = self._weights[j]
-        # Re-normalize after lock enforcement
-        target_weights = target_weights / (target_weights.sum() + 1e-10)
+        # ── Softmax Temperature: sharpen conviction ────────────────────────
+        sharpened = action.astype(np.float64) * self.TEMPERATURE
+        target_weights = self._softmax(sharpened).astype(np.float32)
 
         # ── Deadband Filter: silence exploration noise micro-churning ──────
         weight_delta = target_weights - self._weights
         weight_delta = np.where(np.abs(weight_delta) < self.DEADBAND, 0.0, weight_delta)
         executed_weights = self._weights + weight_delta
-        executed_weights = executed_weights / (executed_weights.sum() + 1e-10)
-
-        # ── Start new locks on positions that increased ────────────────────
-        for j in range(self._n_assets + 1):
-            if executed_weights[j] > self._weights[j] + self.DEADBAND:
-                self._lock_timer[j] = self.LOCK_DAYS
+        executed_weights = executed_weights / (executed_weights.sum() + 1e-10)  # re-normalize
 
         # ── Turnover: computed on actually-executed weight changes ──────────
         turnover = float(np.sum(np.abs(executed_weights - self._weights)))
@@ -440,11 +403,11 @@ class NepsePortfolioEnv(gym.Env):
         rp_return = float(np.dot(rp_weights, returns))
         active_return = port_return - rp_return
 
-        # ── Reward: Pure Relative Momentum ─────────────────────────────────
-        #  Agent is rewarded ONLY on its distance from the RP benchmark.
-        #  If RP is down -2% and agent is down -0.5%, reward is positive.
-        #  No absolute return component — purely relative alpha.
-        reward = self.ALPHA_SCALE * active_return - friction
+        # ── Reward Topology ────────────────────────────────────────────────
+        #  1) Absolute return (survive the market)
+        #  2) Turnover friction (don't churn)
+        #  3) Alpha Gradient: 30× bonus for beating Risk Parity benchmark
+        reward = port_return - friction + self.ALPHA_SCALE * active_return
 
         # ── Update portfolio value (actual PnL, no alpha bonus) ────────────
         self._pv *= np.exp(port_return - friction)
@@ -458,8 +421,7 @@ class NepsePortfolioEnv(gym.Env):
 
     def _obs(self):
         i = min(self._si + self._t, self._n - 1)
-        obs_dim = self._n_assets * N_FEATURES + (self._n_assets + 1) + (self._n_assets + 1)
-        obs = np.zeros(obs_dim, dtype=np.float32)
+        obs = np.zeros(self._n_assets * N_FEATURES + self._n_assets + 1, dtype=np.float32)
 
         # Fill 11 features per asset
         for j, tk in enumerate(self._current_universe):
@@ -473,11 +435,6 @@ class NepsePortfolioEnv(gym.Env):
         off = self._n_assets * N_FEATURES
         obs[off:off + self._n_assets + 1] = self._weights
 
-        # Append lock timers (normalized: 0=unlocked, 1=fully locked)
-        off2 = off + self._n_assets + 1
-        obs[off2:off2 + self._n_assets + 1] = (
-            self._lock_timer.astype(np.float32) / max(self.LOCK_DAYS, 1))
-
         return np.nan_to_num(obs, nan=0.0, posinf=0.0, neginf=0.0)
 
     def _info(self):
@@ -486,8 +443,6 @@ class NepsePortfolioEnv(gym.Env):
             "date": self._dates[i],
             "portfolio_value": float(self._pv),
             "cash_weight": float(self._weights[0]),
-            "macro_veto": int(self._macro_veto_active),
-            "locked_slots": int(np.sum(self._lock_timer > 0)),
         }
         for j, tk in enumerate(self._current_universe):
             info[f"w_{tk}"] = float(self._weights[j + 1])
@@ -666,7 +621,7 @@ def plot_dashboard(tracker, run_dir, total_ts, num_envs, split_date):
     ax.set_xlabel("Timesteps"); ax.set_ylabel("Explained Var")
     ax.set_title("Value Function Quality"); ax.grid(alpha=0.3)
 
-    plt.suptitle(f"NEPSE Portfolio v12 — {total_ts/1e6:.0f}M steps, "
+    plt.suptitle(f"NEPSE Portfolio v11 — {total_ts/1e6:.0f}M steps, "
                  f"{num_envs} envs, {split_date}", fontsize=14)
     plt.tight_layout()
     plt.savefig(run_dir / "training_dashboard.png", dpi=150, bbox_inches="tight")
@@ -760,9 +715,9 @@ def main():
             log.info(f"  OK {tk} valid_start={si} "
                      f"({pd.Timestamp(dates_array[si]).strftime('%Y-%m-%d')})")
 
-    obs_dim = N_ASSETS * N_FEATURES + (N_ASSETS + 1) + (N_ASSETS + 1)  # 132
-    act_dim = N_ASSETS + 2  # 11 portfolio + 1 macro veto = 12
-    log.info(f"Obs dim: {obs_dim} (feats+weights+locks), Act dim: {act_dim} (weights+veto)")
+    obs_dim = N_ASSETS * N_FEATURES + (N_ASSETS + 1)
+    act_dim = N_ASSETS + 1
+    log.info(f"Obs dim: {obs_dim}, Act dim: {act_dim}")
 
     # ── Env factory (parameterized by split_index) ──────────────────────────
     def make_env(rank, split_index, seed=SEED):
@@ -972,7 +927,7 @@ def main():
             "device", "gpu",
         ],
         "value": [
-            "v12_actionlock_macroveto_relmomentum",
+            "v11_walkforward_riskparity",
             n_folds, ",".join(FOLD_DATES),
             FOLD_1_TIMESTEPS, FOLD_N_TIMESTEPS, total_ts,
             ",".join(EVAL_UNIVERSE), N_ASSETS, obs_dim, act_dim,

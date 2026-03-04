@@ -1,6 +1,6 @@
 # nepserl — Quantitative Trading Research Platform
 
-**Time-series forecasting, rule-based strategies, ML signal filtering, and deep RL for the Nepal Stock Exchange.**
+**Time-series forecasting, rule-based strategies, ML signal filtering, and deep reinforcement learning for the Nepal Stock Exchange (NEPSE).**
 
 A research-grade framework for systematic trading on NEPSE — covering the full pipeline from data ingestion to portfolio-level backtesting. Implements 7 rule-based strategies, LightGBM signal quality models, and PPO-based reinforcement learning agents across 441 tickers and 14 years of daily OHLCV data (130k+ bars).
 

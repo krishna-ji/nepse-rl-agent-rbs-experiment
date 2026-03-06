@@ -15,11 +15,15 @@ Generates a full analytics report from both Ichimoku strategies
   Page 8  : Rolling metrics (60-trade rolling WR, PF, expectancy)
   Page 9  : Exit reason breakdown + Top/Bottom tickers
   Page 10 : Strategy comparison side-by-side summary table
+
+Usage::
+
+    python labs/lgbm/rbs_report.py
 """
 
 import warnings; warnings.filterwarnings("ignore")
 
-import pathlib, sys, datetime, logging
+import pathlib, sys, datetime
 import numpy as np
 import pandas as pd
 import matplotlib
@@ -36,10 +40,10 @@ from scipy import stats as sp_stats
 # ============================================================================
 
 PROJECT_ROOT = pathlib.Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(PROJECT_ROOT / "labs" / "rbs"))
+sys.path.insert(0, str(PROJECT_ROOT))
 
-import ichimoku_kumo_break as kumo_mod
-import ichimoku_tk_cross   as tk_mod
+from src.rbs.kumo_break import KumoBreak
+from src.rbs.tk_cross import TKCross
 
 FILTER_DATE = "2010-01-01"
 FRICTION_PCT = 1.5
@@ -74,28 +78,20 @@ plt.rcParams.update({
 
 def generate_all_trades():
     """Run both strategies, return combined DataFrame."""
-    null_log = logging.getLogger("rbs_report_null")
-    null_log.handlers = [logging.NullHandler()]
-    frames = kumo_mod.load_ohlcv(null_log)
-    print(f"[DATA] Loaded OHLCV for {len(frames)} tickers")
-
     print("[KUMO] Running Kumo Break backtest...")
-    kumo_trades = []
-    for tk, df in sorted(frames.items()):
-        t = kumo_mod.backtest_ticker(tk, df)
-        if t: kumo_trades.extend(t)
-    print(f"[KUMO] {len(kumo_trades)} trades")
+    kumo = KumoBreak()
+    kumo.run()
+    df_kumo = kumo.trades_df
+    print(f"[KUMO] {len(df_kumo)} trades")
 
     print("[TK]   Running T/K Cross backtest...")
-    tk_trades = []
-    for tk, df in sorted(frames.items()):
-        t = tk_mod.backtest_ticker(tk, df)
-        if t: tk_trades.extend(t)
-    print(f"[TK]   {len(tk_trades)} trades")
+    tk = TKCross()
+    tk._frames = kumo._frames  # share data
+    tk.run()
+    df_tk = tk.trades_df
+    print(f"[TK]   {len(df_tk)} trades")
 
-    df_k = pd.DataFrame(kumo_trades); df_k["strategy"] = "Kumo Break"
-    df_t = pd.DataFrame(tk_trades);   df_t["strategy"] = "T/K Cross"
-    combined = pd.concat([df_k, df_t], ignore_index=True)
+    combined = pd.concat([df_kumo, df_tk], ignore_index=True)
     combined["entry_date"] = pd.to_datetime(combined["entry_date"])
     combined["exit_date"]  = pd.to_datetime(combined["exit_date"])
     combined = combined[combined["entry_date"] >= pd.Timestamp(FILTER_DATE)].copy()
@@ -181,7 +177,6 @@ def page_year_strategy_heatmap(pdf, df):
         ax.set_yticklabels(pivot.index, fontsize=8)
         ax.set_title(title, fontsize=11, fontweight="bold")
 
-        # Annotate
         for i in range(pivot.shape[0]):
             for j in range(pivot.shape[1]):
                 val = pivot.iloc[i, j]
@@ -198,13 +193,11 @@ def page_year_strategy_heatmap(pdf, df):
 # ============================================================================
 
 def page_ticker_year_heatmap(pdf, df, top_n=40):
-    # Get tickers with most trades
     top_tickers = df["ticker"].value_counts().head(top_n).index.tolist()
     sub = df[df["ticker"].isin(top_tickers)]
 
     pivot = sub.pivot_table(values="adj_pnl_pct", index="ticker", columns="year",
                             aggfunc="mean", fill_value=np.nan)
-    # Sort by total PnL
     pivot["_total"] = pivot.sum(axis=1)
     pivot = pivot.sort_values("_total", ascending=False).drop(columns="_total")
 
@@ -222,7 +215,6 @@ def page_ticker_year_heatmap(pdf, df, top_n=40):
     ax.set_yticklabels(pivot.index, fontsize=7)
     ax.set_xlabel("Year"); ax.set_ylabel("Ticker")
 
-    # Annotate
     for i in range(pivot.shape[0]):
         for j in range(pivot.shape[1]):
             val = pivot.iloc[i, j]
@@ -317,7 +309,6 @@ def page_monthly_heatmap(pdf, df):
     for ax, (strat, sub) in zip(axes, df.groupby("strategy")):
         pivot = sub.pivot_table(values="adj_pnl_pct", index="year", columns="month",
                                 aggfunc="mean", fill_value=np.nan)
-        # Ensure all 12 months
         for m in range(1, 13):
             if m not in pivot.columns:
                 pivot[m] = np.nan
@@ -352,12 +343,10 @@ def page_pnl_distribution(pdf, df):
     fig, axes = plt.subplots(2, 2, figsize=(16, 10))
     fig.suptitle("PnL % Distribution Analysis", fontsize=14, fontweight="bold", y=0.99)
 
-    # Full distribution
     ax = axes[0, 0]
     pnl = df["adj_pnl_pct"].dropna()
     bins = np.linspace(pnl.min(), pnl.max(), 60)
     ax.hist(pnl, bins=bins, color="#4a90d9", alpha=0.7, edgecolor="white", linewidth=0.3, density=True)
-    # KDE
     if len(pnl) > 5:
         kde = sp_stats.gaussian_kde(pnl)
         x_kde = np.linspace(pnl.min(), pnl.max(), 200)
@@ -369,7 +358,6 @@ def page_pnl_distribution(pdf, df):
     ax.set_xlabel("PnL %"); ax.set_ylabel("Density")
     ax.legend(fontsize=8)
 
-    # By strategy
     ax = axes[0, 1]
     for strat, color in [("Kumo Break", "#e8710a"), ("T/K Cross", "#1a73e8")]:
         sub = df[df["strategy"] == strat]["adj_pnl_pct"].dropna()
@@ -380,20 +368,18 @@ def page_pnl_distribution(pdf, df):
     ax.set_xlabel("PnL %"); ax.set_ylabel("Density")
     ax.legend(fontsize=8)
 
-    # Box plot by strategy
     ax = axes[1, 0]
     strategies = df["strategy"].unique()
     data_bp = [df[df["strategy"] == s]["adj_pnl_pct"].dropna().values for s in strategies]
     bp = ax.boxplot(data_bp, labels=strategies, patch_artist=True, showmeans=True,
                     meanprops=dict(marker="D", markerfacecolor="red", markersize=5))
     colors_bp = ["#e8710a", "#1a73e8"]
-    for patch, c in zip(bp["boxes"], colors_bp):
+    for patch, c in zip(bp["boxes"], colors_bp[:len(bp["boxes"])]):
         patch.set_facecolor(c); patch.set_alpha(0.4)
     ax.axhline(0, color="black", linewidth=0.5)
     ax.set_title("PnL Box Plot by Strategy", fontweight="bold")
     ax.set_ylabel("PnL %")
 
-    # Stats table
     ax = axes[1, 1]
     ax.axis("off")
     stats_all = _compute_stats(df)
@@ -420,15 +406,12 @@ def page_pnl_distribution(pdf, df):
     table.auto_set_font_size(False)
     table.set_fontsize(8)
     table.scale(1, 1.5)
-    # Color header
     for j, key in enumerate(headers):
         table[0, j].set_facecolor("#333333")
         table[0, j].set_text_props(color="white", fontweight="bold")
-    # Color data rows
     for i in range(1, len(rows) + 1):
         for j in range(len(headers)):
             table[i, j].set_facecolor("#f0f0f0" if i % 2 == 0 else "white")
-
     ax.set_title("Statistical Summary", fontweight="bold", pad=20)
 
     plt.tight_layout(rect=[0, 0, 1, 0.96])
@@ -443,7 +426,6 @@ def page_duration_analysis(pdf, df):
     fig, axes = plt.subplots(2, 2, figsize=(16, 10))
     fig.suptitle("Trade Duration & Holding Period Analysis", fontsize=14, fontweight="bold", y=0.99)
 
-    # Duration histogram
     ax = axes[0, 0]
     bars = df["bars_held"].dropna()
     ax.hist(bars, bins=range(0, int(bars.max()) + 2), color="#4a90d9", alpha=0.7,
@@ -454,7 +436,6 @@ def page_duration_analysis(pdf, df):
     ax.set_xlabel("Bars Held"); ax.set_ylabel("Count")
     ax.legend(fontsize=8)
 
-    # Duration vs PnL scatter
     ax = axes[0, 1]
     wins = df[df["adj_pnl_pct"] > 0]
     loss = df[df["adj_pnl_pct"] <= 0]
@@ -465,7 +446,6 @@ def page_duration_analysis(pdf, df):
     ax.set_xlabel("Bars Held"); ax.set_ylabel("PnL %")
     ax.legend(fontsize=8)
 
-    # Duration bins — avg PnL
     ax = axes[1, 0]
     df_copy = df.copy()
     df_copy["dur_bin"] = pd.cut(df_copy["bars_held"], bins=[0, 5, 10, 15, 20, 30, 50, 100, 500],
@@ -479,14 +459,12 @@ def page_duration_analysis(pdf, df):
     bars_plot = ax.bar(dur_stats.index.astype(str), dur_stats["avg_pnl"], color=colors,
                        alpha=0.7, edgecolor="gray", linewidth=0.3)
     ax.axhline(0, color="black", linewidth=0.5)
-    # Add count labels
     for bar, cnt in zip(bars_plot, dur_stats["count"]):
         ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height(),
                 f"n={cnt}", ha="center", va="bottom", fontsize=7)
     ax.set_title("Avg PnL % by Holding Period", fontweight="bold")
     ax.set_xlabel("Bars Held"); ax.set_ylabel("Avg PnL %")
 
-    # Win rate by duration bin
     ax = axes[1, 1]
     dur_stats["wr_pct"] = dur_stats["wr"] * 100
     colors = ["#228B22" if v >= 35 else "#DC143C" if v < 25 else "#FFA500"
@@ -513,7 +491,6 @@ def page_streaks(pdf, df):
         sub = sub.sort_values("entry_date").reset_index(drop=True)
         wins_arr = sub["win"].values
 
-        # Compute streaks
         streaks = []
         current_val = wins_arr[0]
         current_len = 1
@@ -529,7 +506,6 @@ def page_streaks(pdf, df):
         win_streaks  = [s[1] for s in streaks if s[0] == "Win"]
         loss_streaks = [s[1] for s in streaks if s[0] == "Loss"]
 
-        # Streak histogram
         ax = axes[0, idx]
         max_streak = max(max(win_streaks, default=0), max(loss_streaks, default=0))
         bins = range(1, max_streak + 2)
@@ -539,7 +515,6 @@ def page_streaks(pdf, df):
         ax.set_xlabel("Streak Length"); ax.set_ylabel("Frequency")
         ax.legend(fontsize=8)
 
-        # Rolling PnL
         ax = axes[1, idx]
         rolling_pnl = sub["adj_pnl_pct"].cumsum()
         ax.plot(range(len(rolling_pnl)), rolling_pnl.values, color="#1a73e8", linewidth=0.8)
@@ -551,7 +526,6 @@ def page_streaks(pdf, df):
         ax.set_title(f"{strat} — Cumulative PnL % (Trade Sequence)", fontweight="bold")
         ax.set_xlabel("Trade #"); ax.set_ylabel("Cumulative PnL %")
 
-        # Add streak stats
         max_w = max(win_streaks, default=0)
         max_l = max(loss_streaks, default=0)
         avg_w = np.mean(win_streaks) if win_streaks else 0
@@ -578,15 +552,12 @@ def page_rolling_metrics(pdf, df):
         if len(sub) < window:
             continue
 
-        # Rolling win rate
         roll_wr = sub["win"].rolling(window).mean() * 100
         axes[0].plot(sub["entry_date"], roll_wr, color=color, linewidth=1, label=strat, alpha=0.8)
 
-        # Rolling avg PnL (expectancy)
         roll_pnl = sub["adj_pnl_pct"].rolling(window).mean()
         axes[1].plot(sub["entry_date"], roll_pnl, color=color, linewidth=1, label=strat, alpha=0.8)
 
-        # Rolling profit factor
         def _rolling_pf(series, w):
             pf_vals = []
             for i in range(len(series)):
@@ -596,7 +567,7 @@ def page_rolling_metrics(pdf, df):
                     chunk = series.iloc[i - w + 1:i + 1]
                     gp = chunk[chunk > 0].sum()
                     gl = abs(chunk[chunk <= 0].sum())
-                    pf_vals.append(gp / gl if gl > 0 else 5.0)  # cap at 5
+                    pf_vals.append(gp / gl if gl > 0 else 5.0)
             return pd.Series(pf_vals, index=series.index)
 
         roll_pf = _rolling_pf(sub["adj_pnl_pct"], window)
@@ -629,7 +600,6 @@ def page_exit_and_tickers(pdf, df):
     gs = gridspec.GridSpec(2, 2, figure=fig, hspace=0.35, wspace=0.3)
     fig.suptitle("Exit Reason Breakdown & Ticker Performance", fontsize=14, fontweight="bold", y=0.99)
 
-    # Exit reason pie charts
     for idx, (strat, sub) in enumerate(df.groupby("strategy")):
         ax = fig.add_subplot(gs[0, idx])
         reasons = sub["exit_reason"].value_counts()
@@ -639,10 +609,9 @@ def page_exit_and_tickers(pdf, df):
             colors=colors, textprops={"fontsize": 8}, pctdistance=0.8)
         ax.set_title(f"{strat} — Exit Reasons", fontweight="bold")
 
-    # Top 15 tickers by total PnL
     ax = fig.add_subplot(gs[1, 0])
     ticker_pnl = df.groupby("ticker")["adj_pnl_pct"].agg(["sum", "count", "mean"])
-    ticker_pnl = ticker_pnl[ticker_pnl["count"] >= 3]  # min 3 trades
+    ticker_pnl = ticker_pnl[ticker_pnl["count"] >= 3]
     top15 = ticker_pnl.sort_values("sum", ascending=False).head(15)
     colors = ["#228B22" if v >= 0 else "#DC143C" for v in top15["sum"]]
     bars = ax.barh(top15.index[::-1], top15["sum"][::-1], color=colors[::-1],
@@ -650,12 +619,10 @@ def page_exit_and_tickers(pdf, df):
     ax.axvline(0, color="black", linewidth=0.5)
     ax.set_title("Top 15 Tickers (Total PnL %)", fontweight="bold")
     ax.set_xlabel("Total PnL %")
-    # Add trade count
     for bar, cnt in zip(bars, top15["count"][::-1]):
         ax.text(bar.get_width(), bar.get_y() + bar.get_height() / 2,
                 f" n={int(cnt)}", va="center", fontsize=7)
 
-    # Bottom 15 tickers
     ax = fig.add_subplot(gs[1, 1])
     bot15 = ticker_pnl.sort_values("sum", ascending=True).head(15)
     colors = ["#228B22" if v >= 0 else "#DC143C" for v in bot15["sum"]]
@@ -680,7 +647,6 @@ def page_risk_table(pdf, df):
     fig, axes = plt.subplots(2, 1, figsize=(16, 11), gridspec_kw={"height_ratios": [1, 1]})
     fig.suptitle("Comprehensive Risk & Return Metrics", fontsize=14, fontweight="bold", y=0.99)
 
-    # Yearly returns table
     ax = axes[0]
     ax.axis("off")
     yearly = df.groupby(["year", "strategy"]).agg(
@@ -693,7 +659,6 @@ def page_risk_table(pdf, df):
     ).reset_index()
     yearly["wr"] *= 100
 
-    # Build table data
     years = sorted(df["year"].unique())
     headers = ["Year", "Kumo Trades", "Kumo PnL%", "Kumo WR%", "TK Trades", "TK PnL%", "TK WR%"]
     rows = []
@@ -716,9 +681,8 @@ def page_risk_table(pdf, df):
     for j in range(len(headers)):
         table[0, j].set_facecolor("#333333")
         table[0, j].set_text_props(color="white", fontweight="bold", fontsize=8)
-    # Color cells by PnL
     for i, row in enumerate(rows):
-        for j in [2, 5]:  # PnL columns
+        for j in [2, 5]:
             try:
                 val = float(row[j])
                 bg = "#c8e6c9" if val > 0 else "#ffcdd2" if val < 0 else "white"
@@ -731,7 +695,6 @@ def page_risk_table(pdf, df):
                     table[i + 1, j].set_facecolor("#f5f5f5")
     ax.set_title("Yearly Return Summary by Strategy", fontweight="bold", pad=15)
 
-    # Risk metrics scatter: Win Rate vs Avg Win/Loss ratio
     ax = axes[1]
     for strat, color, marker in [("Kumo Break", "#e8710a", "o"), ("T/K Cross", "#1a73e8", "s")]:
         for y in years:
@@ -747,9 +710,8 @@ def page_risk_table(pdf, df):
             ax.scatter(wr, ratio, c=color, marker=marker, s=40, alpha=0.6, edgecolor="gray", linewidth=0.3)
             ax.annotate(str(y), (wr, ratio), fontsize=5, ha="center", va="bottom")
 
-    # Breakeven lines
     wr_range = np.linspace(10, 80, 100)
-    be_ratio = (100 - wr_range) / wr_range  # breakeven W/L ratio
+    be_ratio = (100 - wr_range) / wr_range
     ax.plot(wr_range, be_ratio, "k--", linewidth=0.8, label="Breakeven")
     ax.scatter([], [], c="#e8710a", marker="o", label="Kumo Break")
     ax.scatter([], [], c="#1a73e8", marker="s", label="T/K Cross")
@@ -782,7 +744,6 @@ def main():
     print(f"       Kumo Break: {(df['strategy']=='Kumo Break').sum()}")
     print(f"       T/K Cross:  {(df['strategy']=='T/K Cross').sum()}")
 
-    # Save raw data
     df.to_csv(run_dir / "rbs_all_trades.csv", index=False)
 
     print(f"\n[PDF] Generating report...")

@@ -9,15 +9,19 @@ This is the "no ML" baseline — every valid signal competes for portfolio
 slots, prioritized by earliest entry date then random tiebreak.
 
 Rules (identical to the ML version):
-- 8 max concurrent slots × रू 1,25,000 fixed per trade, NO compounding.
+- 8 max concurrent slots × portfolio / 8 per trade, compounding.
 - 1.5% friction deducted from every trade.
 - When more signals than free slots on a given day, take them randomly
   (no ML ranking available — fair comparison baseline).
+
+Usage::
+
+    python labs/lgbm/portfolio_sim_rbs.py
 """
 
 import warnings; warnings.filterwarnings("ignore")
 
-import pathlib, sys, datetime, logging, importlib
+import pathlib, sys, datetime
 import numpy as np
 import pandas as pd
 import matplotlib
@@ -30,10 +34,10 @@ from matplotlib.ticker import FuncFormatter
 # ============================================================================
 
 PROJECT_ROOT = pathlib.Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(PROJECT_ROOT / "labs" / "rbs"))
+sys.path.insert(0, str(PROJECT_ROOT))
 
-import ichimoku_kumo_break as kumo_mod
-import ichimoku_tk_cross    as tk_mod
+from src.rbs.kumo_break import KumoBreak
+from src.rbs.tk_cross import TKCross
 
 RUN_DIR = None  # set in main()
 
@@ -71,47 +75,27 @@ def npr_formatter(x, _):
 
 def generate_trades() -> pd.DataFrame:
     """
-    Run both Ichimoku backtesters on all tickers and return a combined
+    Run both Ichimoku strategies on all tickers and return a combined
     DataFrame of trades with a 'strategy' column.
     """
-    # Silence the per-strategy loggers that want to write files
-    null_log = logging.getLogger("rbs_portfolio_null")
-    null_log.handlers = [logging.NullHandler()]
-
-    # Load OHLCV data once (both strategies use the same loader)
-    frames = kumo_mod.load_ohlcv(null_log)
-    print(f"[DATA] Loaded OHLCV for {len(frames)} tickers")
-
-    # Run Kumo Break on all tickers
+    # Run Kumo Break
     print("[KUMO] Running Kumo Break backtest...")
-    kumo_trades = []
-    for tk, df in sorted(frames.items()):
-        trades = kumo_mod.backtest_ticker(tk, df)
-        if trades:
-            kumo_trades.extend(trades)
-    print(f"[KUMO] Generated {len(kumo_trades)} trades")
+    kumo = KumoBreak()
+    kumo.run()
+    df_kumo = kumo.trades_df
+    print(f"[KUMO] Generated {len(df_kumo)} trades")
 
-    # Run T/K Cross on all tickers
+    # Run T/K Cross — share loaded data to avoid double I/O
     print("[TK]   Running T/K Cross backtest...")
-    tk_trades = []
-    for tk, df in sorted(frames.items()):
-        trades = tk_mod.backtest_ticker(tk, df)
-        if trades:
-            tk_trades.extend(trades)
-    print(f"[TK]   Generated {len(tk_trades)} trades")
-
-    # Build DataFrames
-    df_kumo = pd.DataFrame(kumo_trades)
-    df_kumo["strategy"] = "kumo_break"
-    df_tk   = pd.DataFrame(tk_trades)
-    df_tk["strategy"]   = "tk_cross"
+    tk = TKCross()
+    tk._frames = kumo._frames  # share data
+    tk.run()
+    df_tk = tk.trades_df
+    print(f"[TK]   Generated {len(df_tk)} trades")
 
     combined = pd.concat([df_kumo, df_tk], ignore_index=True)
-
-    # Normalise dates
     combined["entry_date"] = pd.to_datetime(combined["entry_date"])
     combined["exit_date"]  = pd.to_datetime(combined["exit_date"])
-
     combined = combined.sort_values("entry_date").reset_index(drop=True)
     return combined
 
@@ -127,7 +111,6 @@ def simulate(signals: pd.DataFrame):
     """
     np.random.seed(SEED)
 
-    # Group signals by entry_date
     sig_by_day = signals.groupby("entry_date")
     all_dates  = sorted(signals["entry_date"].unique())
     exit_dates = signals["exit_date"].dropna().unique()
@@ -135,7 +118,7 @@ def simulate(signals: pd.DataFrame):
 
     open_trades: list[dict] = []
     trades_log:  list[dict] = []
-    portfolio_value = float(INITIAL_CAPITAL)  # grows/shrinks with PnL
+    portfolio_value = float(INITIAL_CAPITAL)
     skipped     = 0
 
     equity_dates  = []
@@ -170,10 +153,7 @@ def simulate(signals: pd.DataFrame):
         free_slots = MAX_SLOTS - len(open_trades)
         if free_slots > 0 and day in sig_by_day.groups:
             day_signals = sig_by_day.get_group(day).copy()
-            # Shuffle for fair selection (no ML ranking available)
             day_signals = day_signals.sample(frac=1.0, random_state=SEED)
-
-            # Compute current trade size based on portfolio value
             trade_sz = max(portfolio_value / MAX_SLOTS, 0)
 
             for _, row in day_signals.iterrows():
@@ -236,7 +216,6 @@ def plot_equity_dual(eq_kumo: pd.Series, eq_tk: pd.Series, eq_combined: pd.Serie
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(16, 9), height_ratios=[3, 1],
                                     sharex=True, gridspec_kw={"hspace": 0.08})
 
-    # --- Equity curves ---
     ax1.plot(eq_kumo.index, eq_kumo.values, color="#e8710a", linewidth=1.3,
              label=f"Kumo Break ({len(trades_kumo)} trades)", alpha=0.9)
     ax1.plot(eq_tk.index, eq_tk.values, color="#1a73e8", linewidth=1.3,
@@ -252,7 +231,6 @@ def plot_equity_dual(eq_kumo: pd.Series, eq_tk: pd.Series, eq_combined: pd.Serie
                   fontsize=13, fontweight="bold")
     ax1.grid(True, alpha=0.3)
 
-    # --- Drawdown for each ---
     for eq, color, label in [
         (eq_kumo, "#e8710a", "Kumo Break"),
         (eq_tk, "#1a73e8", "T/K Cross"),
@@ -267,7 +245,6 @@ def plot_equity_dual(eq_kumo: pd.Series, eq_tk: pd.Series, eq_combined: pd.Serie
     ax2.legend(loc="lower left", fontsize=8)
     ax2.grid(True, alpha=0.3)
 
-    # Summary box
     def _stats(trades, eq):
         n = len(trades)
         pnl = eq.iloc[-1] - INITIAL_CAPITAL if len(eq) > 0 else 0
@@ -297,10 +274,9 @@ def plot_equity_dual(eq_kumo: pd.Series, eq_tk: pd.Series, eq_combined: pd.Serie
 # ============================================================================
 
 def _print_strategy_summary(name: str, trades: list, equity: pd.Series):
-    n_exec    = len(trades)
+    n_exec = len(trades)
     if n_exec == 0:
-        print(f"\n  {name}: No trades.")
-        return
+        print(f"\n  {name}: No trades."); return
     total_pnl = sum(t["pnl_npr"] for t in trades)
     wins      = sum(1 for t in trades if t["adj_pnl_pct"] > 0)
     losses    = n_exec - wins
@@ -353,16 +329,16 @@ def main():
     print(f"\n[DATA] Total trades (all time): {total_signals}")
     print(f"[DATA] After 2010 filter: {len(oos)}")
 
-    n_kumo = (oos["strategy"] == "kumo_break").sum()
-    n_tk   = (oos["strategy"] == "tk_cross").sum()
+    n_kumo = (oos["strategy"] == "Kumo Break").sum()
+    n_tk   = (oos["strategy"] == "T/K Cross").sum()
     print(f"       ├── Kumo Break : {n_kumo}")
     print(f"       └── T/K Cross  : {n_tk}")
 
     oos = oos.sort_values("entry_date").reset_index(drop=True)
 
     # Simulate each strategy SEPARATELY
-    oos_kumo = oos[oos["strategy"] == "kumo_break"].copy().reset_index(drop=True)
-    oos_tk   = oos[oos["strategy"] == "tk_cross"].copy().reset_index(drop=True)
+    oos_kumo = oos[oos["strategy"] == "Kumo Break"].copy().reset_index(drop=True)
+    oos_tk   = oos[oos["strategy"] == "T/K Cross"].copy().reset_index(drop=True)
 
     print("\n[SIM] Running Kumo Break portfolio...")
     trades_kumo, eq_kumo, skip_kumo = simulate(oos_kumo)

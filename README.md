@@ -201,6 +201,7 @@ docs/
 - **NaN-safe observations** — handles tickers with sparse early history without crashing
 - **Randomized episode sampling** — each RL `reset()` picks a random ticker + start date to prevent overfitting
 - **Realistic friction** — 0.5% per trade, T+3 settlement locks, gap-down forced exits
+- **Walk-forward validation** — all ML/RL models trained strictly on past data, evaluated on future windows
 
 ---
 
